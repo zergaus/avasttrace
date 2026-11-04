@@ -1,0 +1,46 @@
+name: Validate PowerShell distribution
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-checks:
+    name: PowerShell 5.1 syntax and integrity
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: powershell
+        run: |
+          foreach ($file in @('AvastTrace.ps1', 'Install.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $file).Path,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if (@($errors).Count -ne 0) {
+              foreach ($error in $errors) { Write-Host ($error | Out-String) }
+              throw "PowerShell syntax errors in $file"
+            }
+            Write-Host "PASS syntax: $file"
+          }
+
+      - name: Verify published collector checksum
+        shell: powershell
+        run: |
+          $line = @(Get-Content -LiteralPath SHA256SUMS.txt |
+            Where-Object { $_ -match '^[0-9a-fA-F]{64}\s+\*?AvastTrace\.ps1\s*$' })
+          if ($line.Count -ne 1) { throw 'Expected exactly one collector hash entry' }
+          $expected = ($line[0] -split '\s+')[0]
+          $actual = (Get-FileHash -LiteralPath AvastTrace.ps1 -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "Checksum mismatch: $actual / $expected" }
+          Write-Host "PASS SHA256: $actual"
