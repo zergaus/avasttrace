@@ -44,3 +44,30 @@ jobs:
           $actual = (Get-FileHash -LiteralPath AvastTrace.ps1 -Algorithm SHA256).Hash
           if ($actual -ne $expected) { throw "Checksum mismatch: $actual / $expected" }
           Write-Host "PASS SHA256: $actual"
+
+      - name: Exercise incident capture with synthetic Avast text
+        shell: powershell
+        run: |
+          # Synthetic log used only on the disposable CI runner.
+          $avastLog = Join-Path $env:ProgramData 'AVAST Software\Avast\log'
+          New-Item -ItemType Directory -Path $avastLog -Force | Out-Null
+          $fixture = Join-Path $avastLog 'avasttrace-ci-fixture.txt'
+          $marker = 'IDP.Generic - Behavior Shield conhost.exe - AVASTTRACE_CI_FIXTURE'
+          try {
+            [IO.File]::WriteAllText($fixture, $marker)
+            $when = Get-Date
+            & .\AvastTrace.ps1 -Mode Capture -At $when
+            if ($LASTEXITCODE -ne 0) { throw "Incident capture exited: $LASTEXITCODE" }
+
+            $recent = Get-ChildItem (Join-Path $env:ProgramData 'AvastTrace') -Filter 'incident-*.json' |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($null -eq $recent) { throw 'No incident JSON generated' }
+            $report = Get-Content -Raw -LiteralPath $recent.FullName | ConvertFrom-Json
+            $found = @($report.AvastKeywordMatches |
+              Where-Object { $_.Line -match 'AVASTTRACE_CI_FIXTURE' })
+            if ($found.Count -ne 1) { throw 'Synthetic Avast alert was not correlated into incident JSON' }
+            Write-Host "PASS synthetic capture: $($recent.Name)"
+          }
+          finally {
+            Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
+          }
