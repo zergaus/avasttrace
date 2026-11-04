@@ -8,7 +8,63 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$base = 'https://raw.githubusercontent.com/zergaus/avasttrace/main'
+$api = 'https://api.github.com/repos/zergaus/avasttrace/git/ref/heads/main'
+$headers = @{ 'User-Agent' = 'AvastTrace-Installer'; 'Cache-Control' = 'no-cache' }
+$refUri = $api + '?nocache=' + [guid]::NewGuid().ToString('N')
+$ref = Invoke-RestMethod -Uri $refUri -Headers $headers -UseBasicParsing
+$revision = [string]$ref.object.sha
+if ($revision -notmatch '^[0-9a-f]{40}$work = Join-Path ([IO.Path]::GetTempPath()) ('AvastTrace-' + [guid]::NewGuid().ToString('N'))
+$collector = Join-Path $work 'AvastTrace.ps1'
+$manifest = Join-Path $work 'SHA256SUMS.txt'
+$exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+
+try {
+    if (-not [Environment]::OSVersion.Platform.Equals([PlatformID]::Win32NT)) {
+        throw 'AvastTrace requires Windows.'
+    }
+    [void](New-Item -ItemType Directory -Path $work -Force)
+
+    # Explicit HTTPS sources; no arguments from an untrusted manifest become URLs.
+    Invoke-WebRequest -Uri ($base + '/AvastTrace.ps1') -OutFile $collector -UseBasicParsing
+    Invoke-WebRequest -Uri ($base + '/SHA256SUMS.txt') -OutFile $manifest -UseBasicParsing
+
+    $expected = $null
+    foreach ($line in [IO.File]::ReadAllLines($manifest)) {
+        if ($line -match '^([a-fA-F0-9]{64})\s+\*?AvastTrace\.ps1\s*$') {
+            if ($null -ne $expected) { throw 'SHA256SUMS.txt contains duplicate AvastTrace.ps1 entries.' }
+            $expected = $matches[1].ToUpperInvariant()
+        }
+    }
+    if ($null -eq $expected) {
+        throw 'Expected SHA-256 for AvastTrace.ps1 is missing from the manifest.'
+    }
+    $actual = (Get-FileHash -LiteralPath $collector -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($actual -cne $expected) {
+        throw "SHA-256 mismatch. Expected $expected; downloaded $actual. Installation aborted."
+    }
+
+    Write-Host "AvastTrace SHA-256 verified: $actual"
+    Write-Host 'Downloaded collector verified against repository manifest.'
+    Write-Warning 'Both file and checksum come from the same GitHub repository; review the source before execution.'
+
+    $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                   $collector, '-Mode', 'Install')
+    if ($EnableAudit) { $arguments += '-EnableAudit' }
+    & $exe @arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Collector installer failed with exit code $LASTEXITCODE"
+    }
+    Write-Host 'Installer finished. Use -Mode Status on C:\ProgramData\AvastTrace\AvastTrace.ps1 to verify collection.'
+}
+finally {
+    # Avoid leaving a second executable copy in a broadly accessible temp folder.
+    if (Test-Path -LiteralPath $work) {
+        Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+) { throw 'Could not resolve a valid Git commit SHA for AvastTrace.' }
+$base = "https://raw.githubusercontent.com/zergaus/avasttrace/$revision"
+Write-Host "AvastTrace GitHub revision: $revision"
 $work = Join-Path ([IO.Path]::GetTempPath()) ('AvastTrace-' + [guid]::NewGuid().ToString('N'))
 $collector = Join-Path $work 'AvastTrace.ps1'
 $manifest = Join-Path $work 'SHA256SUMS.txt'
