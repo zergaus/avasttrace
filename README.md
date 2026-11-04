@@ -11,7 +11,7 @@
 
 AvastTrace는 보호 기능을 비활성화하거나 파일을 예외 처리하지 않고, 다음 자료를 같은 시간 범위에서 수집해 원인 후보를 좁히도록 만들었습니다.
 
-1. Windows 프로세스 생성 이벤트와 부모 PID (WMI `Win32_ProcessStartTrace`)
+1. Windows 프로세스 생성 이벤트의 **원시 발생 시각**, PID·부모 PID (WMI `Win32_ProcessStartTrace`)
 2. Windows Security 이벤트 **4688** (활성화된 경우 명령줄 포함)
 3. Avast 로그/보고서의 새 탐지 관련 문자열
 4. `conhost.exe` 파일의 SHA-256 및 디지털 서명 상태
@@ -23,12 +23,17 @@ AvastTrace는 보호 기능을 비활성화하거나 파일을 예외 처리하�
 Windows 10/11 PC에서 **PowerShell을 실행하고** 아래 명령을 입력합니다. 파일을 다운로드한 뒤 실행하기 때문에, `iwr | iex` 형태의 원격 코드 직접 실행은 사용하지 않습니다.
 
 ```powershell
+$ErrorActionPreference = 'Stop'
+$refUri = 'https://api.github.com/repos/zergaus/avasttrace/git/ref/heads/main?nocache=' + [guid]::NewGuid().ToString('N')
+$revision = (Invoke-RestMethod $refUri -Headers @{ 'User-Agent' = 'AvastTrace-Installer'; 'Cache-Control' = 'no-cache' }).object.sha
+if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'GitHub revision lookup failed' }
 $installer = Join-Path $env:TEMP 'AvastTrace-Install.ps1'
-Invoke-WebRequest 'https://raw.githubusercontent.com/zergaus/avasttrace/main/Install.ps1' -OutFile $installer -UseBasicParsing
+Invoke-WebRequest "https://raw.githubusercontent.com/zergaus/avasttrace/$revision/Install.ps1" -OutFile $installer -UseBasicParsing -ErrorAction Stop
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer
+if ($LASTEXITCODE -ne 0) { throw 'AvastTrace installation failed' }
 ```
 
-- 설치 스크립트는 `AvastTrace.ps1`과 `SHA256SUMS.txt`를 HTTPS로 내려받아 **SHA-256 일치 여부를 확인한 뒤** 설치합니다.
+- 설치 스크립트는 먼저 GitHub에서 최신 커밋 SHA를 조회한 뒤 **해당 커밋에 고정된** `AvastTrace.ps1`과 `SHA256SUMS.txt`를 HTTPS로 내려받아 **SHA-256 일치 여부를 확인한 뒤** 설치합니다.
 - 설치 과정에서 관리자 권한(UAC)을 요청합니다. 예약 작업 `\AvastTrace\AvastTrace-Collector`를 **SYSTEM / 부팅 시 실행**으로 등록하고 즉시 시작합니다.
 - 데이터는 **해당 PC 내부** `C:\ProgramData\AvastTrace\`에만 저장합니다. **원격 서버·GitHub로 전송하지 않습니다.**
 - **기본 설치는 Windows 감사 정책을 변경하지 않습니다.** 더 정확한 명령줄 증거가 필요할 때만 아래 선택적 설정을 적용합니다.
@@ -80,7 +85,7 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 
 | 파일 | 의미 |
 | --- | --- |
-| `process-YYYYMMDD.jsonl` | WMI 프로세스 시작 기록, 선택적 명령줄/부모 정보 |
+| `process-YYYYMMDD.jsonl` | WMI 프로세스 시작 시각(`At`), 수신 시각(`ObservedAt`), 큐 지연, PID·부모 PID (명령줄은 4688 활용) |
 | `signals-YYYYMMDD.jsonl` | 변경된 Avast 텍스트 로그의 탐지 키워드 |
 | `incident-*.json` | 관련 이벤트·Avast 문자열·실행 프로세스의 조사 자료 |
 | `incident-*.summary.txt` | 사람이 읽는 요약 |
@@ -92,6 +97,8 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 - 로컬 수집 폴더는 관리자와 SYSTEM으로 제한하도록 설계했습니다. 실제 ACL은 설치 후 운영체제에서 확인해야 합니다.
 - 로그 보관기간과 최대 디스크 사용량은 **자동 제한하지 않습니다**. 장기간 사용 시 수집 크기를 점검하세요.
 - Windows 명령줄 감사가 이전에 꺼져 있었다면 **과거 실행 명령을 소급 복구할 수 없습니다**.
+- 오래된 수집기에는 WMI 이벤트 수신시각을 실제 발생 시각으로 잘못 기록한 문제가 있습니다. 최신판은 `At`에 원래 이벤트 시각, `ObservedAt`에 수신시각을 별도로 남깁니다. 4688과 대조할 때는 **이벤트 발생 시각**을 사용하세요.
+- 감사 미활성 상태에서는 WMI만으로 전체 실행 명령줄을 수집하지 않습니다. 최신판은 성능 및 PID 재사용 위험 때문에 WMI 핫패스에서 실시간 프로세스 추가 조회를 수행하지 않습니다.
 - PowerShell·WSL·tmux **프로세스 내부에서 실행된 모든 명령**을 복원하는 쉘 기록기는 아닙니다.
 - Avast 내부 Behavior Shield 판정 규칙, 차단 대상 전체 호출 스택, 숨겨진 Avast 기록까지 확인할 수는 없습니다.
 - Avast 보호/격리/예외를 수정하지 않으며 테스트 목적으로 의심스러운 명령을 재실행하지 않습니다.
@@ -105,7 +112,7 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 
 ## 검증 범위
 
-- **수행:** 소스/설명서 정적 검토, 배포 파일 SHA-256 계산, GitHub 업로드 및 재조회
+- **수행:** PowerShell 5.1 구문 분석, SHA-256 검사, Windows CI에서 합성 Avast 탐지 보고서 생성, GitHub 업로드 및 재조회
 - **미수행:** 실제 Windows 10/11 + Avast에서 WMI 수집, 예약 작업 실행, 관리자 UAC 동작, 4688 활성화·복구, 실제 IDP.Generic 탐지 E2E
 - **권고:** 첫 장비에서 비관리자 설치 상태 → `Status` → 테스트 프로세스 관찰 → `Capture` → `Uninstall` 순으로 확인하고 나머지 장비에 적용
 
