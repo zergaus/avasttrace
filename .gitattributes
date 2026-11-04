@@ -1,0 +1,7 @@
+# Published SHA-256 hashes correspond to raw GitHub LF bytes.
+# Keep PowerShell files byte-stable across Linux and Windows checkouts.
+*.ps1 text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
