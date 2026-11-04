@@ -1,0 +1,18 @@
+# Never publish collected diagnostics, event logs, or support bundles
+process-*.jsonl
+signals-*.jsonl
+errors-*.jsonl
+incident-*.json
+incident-*.summary.txt
+heartbeat.txt
+audit-before-*.json
+*.evtx
+*.dmp
+*.zip
+*.7z
+*.log
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
