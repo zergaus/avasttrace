@@ -70,3 +70,25 @@ jobs:
           finally {
             Remove-Item -LiteralPath $fixture -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Exercise pinned bootstrap installer on disposable Windows runner
+        shell: powershell
+        run: |
+          $installed = Join-Path $env:ProgramData 'AvastTrace\AvastTrace.ps1'
+          try {
+            & .\Install.ps1
+            if (-not (Test-Path -LiteralPath $installed)) { throw 'Installer failed to place collector' }
+
+            $expected = ((Get-Content SHA256SUMS.txt | Select-Object -First 1) -split '\s+')[0]
+            $actual = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
+            if ($actual -ne $expected) { throw 'Installed collector hash mismatch' }
+
+            $task = Get-ScheduledTask -TaskPath '\AvastTrace\' -TaskName 'AvastTrace-Collector'
+            if (-not $task) { throw 'Scheduled task missing after install' }
+            Write-Host "PASS pinned bootstrap installation: SHA256=$actual Task=$($task.State)"
+          }
+          finally {
+            if (Test-Path -LiteralPath $installed) {
+              & $installed -Mode Uninstall
+            }
+          }
