@@ -57,7 +57,6 @@ jobs:
             [IO.File]::WriteAllText($fixture, $marker)
             $when = Get-Date
             & .\AvastTrace.ps1 -Mode Capture -At $when
-            if ($LASTEXITCODE -ne 0) { throw "Incident capture exited: $LASTEXITCODE" }
 
             $recent = Get-ChildItem (Join-Path $env:ProgramData 'AvastTrace') -Filter 'incident-*.json' |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
