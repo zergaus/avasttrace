@@ -163,7 +163,7 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
         }
     }
     $security = Get-Event4688 -From $from -To $to
-    $matches = New-Object 'System.Collections.Generic.List[object]'
+    $avastMatches = New-Object 'System.Collections.Generic.List[object]'
     $fileInventory = New-Object 'System.Collections.Generic.List[object]'
     foreach($file in @(Get-AvastFiles)) {
         try {
@@ -172,8 +172,8 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
             $fileInventory.Add([pscustomobject]@{File=$file.FullName; LastWrite=$file.LastWriteTime.ToString('o'); Bytes=$file.Length; TailTruncated=($file.Length -gt 2097152)})
             foreach($line in @($chunk.Text -split '[\r\n]+')) {
                 if($line -match '(?i)IDP\.Generic|conhost\.exe|Behavior\s*Shield|blocked\b|threat\b') {
-                    $matches.Add([pscustomobject]@{File=$file.FullName; Line=$line.Substring(0,[Math]::Min(1000,$line.Length))})
-                    if($matches.Count -ge 250) { break }
+                    $avastMatches.Add([pscustomobject]@{File=$file.FullName; Line=$line.Substring(0,[Math]::Min(1000,$line.Length))})
+                    if($avastMatches.Count -ge 250) { break }
                 }
             }
         } catch {
@@ -211,7 +211,7 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
         }
         WMIProcessStarts=$processRows.ToArray()
         AvastFileInventory=$fileInventory.ToArray()
-        AvastKeywordMatches=@($matches.ToArray() | Select-Object -First 250)
+        AvastKeywordMatches=@($avastMatches.ToArray() | Select-Object -First 250)
         LiveProcesses=$live
         Limitations=@(
           'Keyword matches in Avast logs are NOT proof that a given process caused a block.',
@@ -232,7 +232,7 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
     $summary.Add("ALERT: $($When.ToString('o')) | $Reason")
     $summary.Add("Window: $($from.ToString('o')) to $($to.ToString('o'))")
     $summary.Add("4688 Count: $($security.Rows.Count); Command lines present: $(@($security.Rows | Where-Object { $_.CommandLine }).Count)")
-    $summary.Add("WMI Starts: $($processRows.Count); Avast Matches: $($matches.Count)")
+    $summary.Add("WMI Starts: $($processRows.Count); Avast Matches: $($avastMatches.Count)")
     $summary.Add('')
     $summary.Add('CONHOST PROCESS CREATIONS IN +/-3 MIN (NOT automatically the cause):')
     foreach($r in $conhosts | Select-Object -First 50) {
@@ -249,7 +249,7 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
     [IO.File]::WriteAllLines($summaryPath,$summary.ToArray(),$Utf8)
     Write-Host "Summary report: $summaryPath"
     Write-Host "Incident report: $dest"
-    Write-Host "  4688: $($security.Rows.Count); WMI: $($processRows.Count); Avast text matches: $($matches.Count)"
+    Write-Host "  4688: $($security.Rows.Count); WMI: $($processRows.Count); Avast text matches: $($avastMatches.Count)"
     if($security.Error){ Write-Warning "4688 unavailable: $($security.Error)" }
     return $dest
 }
