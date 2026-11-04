@@ -290,32 +290,46 @@ function Monitor {
         $lastScan = [datetime]::MinValue
         $lastBeat = [datetime]::MinValue
         while($true) {
+            # A busy host may deliver an unbounded process-event stream. Yield after
+            # each batch so heartbeat and Avast log scanning never starve.
             $ev = Wait-Event -SourceIdentifier $source -Timeout 2
-            while($null -ne $ev) {
+            $processed = 0
+            while($null -ne $ev -and $processed -lt 100) {
                 try {
                     $ne = $ev.SourceEventArgs.NewEvent
                     $id = [int]$ne.ProcessID
                     $parentId = [int]$ne.ParentProcessID
                     $name = [string]$ne.ProcessName
-                    $extra = $null
-                    $parent = $null
-                    if($name -match $InterestingNames) {
-                        $extra = Get-WindowsProcess -Id $id
-                        $parent = Get-WindowsProcess -Id $parentId
-                    }
+                    $observed = Get-Date
+                    $started = $observed
+                    try {
+                        $ticks = [long][string]$ne.TIME_CREATED
+                        if ($ticks -gt 0) {
+                            $started = [datetime]::FromFileTimeUtc($ticks).ToLocalTime()
+                        }
+                    } catch { }
+                    # Do not synchronously query Win32_Process for every event.
+                    # On busy machines it stalls the event consumer and can fetch a
+                    # DIFFERENT process after a short-lived PID is reused. For exact
+                    # command lines and full image paths use Security event 4688.
                     Log-Json 'process' ([pscustomobject]@{
-                        At=(Get-Date).ToString('o'); Name=$name; PID=$id; ParentPID=$parentId
+                        At=$started.ToString('o')
+                        ObservedAt=$observed.ToString('o')
+                        QueueDelaySeconds=[math]::Round(($observed - $started).TotalSeconds,3)
+                        Name=$name; PID=$id; ParentPID=$parentId
                         WmiEventTime=[string]$ne.TIME_CREATED
-                        Path=if($extra){$extra.Path}else{$null}
-                        CommandLine=if($extra){$extra.CommandLine}else{$null}
-                        ParentName=if($parent){$parent.Name}else{$null}
-                        ParentCommandLine=if($parent){$parent.CommandLine}else{$null}
-                        ParentStarted=if($parent){$parent.Started}else{$null}
+                        Path=$null; CommandLine=$null; ParentName=$null
+                        ParentCommandLine=$null; ParentStarted=$null
                     })
                 } catch { Log-Error "Process event handling failed: $($_.Exception.Message)" }
-                finally { Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue }
+                finally {
+                    Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue
+                    $processed++
+                }
                 $ev = @(Get-Event -SourceIdentifier $source -ErrorAction SilentlyContinue | Select-Object -First 1)
-                if($ev -is [array]) { if($ev.Count -eq 0){$ev=$null}else{$ev=$ev[0]} }
+                if($ev -is [array]) {
+                    if($ev.Count -eq 0){$ev=$null}else{$ev=$ev[0]}
+                }
             }
             if(((Get-Date) - $lastScan).TotalSeconds -ge 5) {
                 Scan-AvastAppend
