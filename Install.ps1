@@ -3,7 +3,8 @@
 # No Invoke-Expression, no antivirus exclusions, no remote log uploads.
 [CmdletBinding()]
 param(
-    [switch]$EnableAudit
+    [switch]$EnableAudit,
+    [switch]$Preserve4688
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +54,7 @@ try {
     $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
                    $collector, '-Mode', 'Install')
     if ($EnableAudit) { $arguments += '-EnableAudit' }
+    if ($Preserve4688) { $arguments += '-Preserve4688' }
     & $exe @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Collector installer failed with exit code $LASTEXITCODE"
