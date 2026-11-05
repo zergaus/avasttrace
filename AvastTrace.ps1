@@ -1,13 +1,15 @@
-# AvastTrace v1.0 - Windows PowerShell 5.1, Windows 10/11
+# AvastTrace v1.1.0 - Windows PowerShell 5.1, Windows 10/11
 # Purpose: observe process starts and correlate them with Avast log changes.
 # This is a read-only collector except for its own files, scheduled task, and
 # the optional -EnableAudit flag. It never disables or excludes protection.
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Monitor','Capture','Status','Uninstall')]
+    [ValidateSet('Install','Monitor','Capture','Status','Uninstall','SelfTest')]
     [string]$Mode = 'Install',
     [switch]$EnableAudit,
-    [datetime]$At = [datetime]::MinValue
+    [datetime]$At = [datetime]::MinValue,
+    [datetime]$DetectionAt = [datetime]::MinValue,
+    [string]$TargetImage = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +40,8 @@ function Ensure-Admin {
     $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'),'-Mode',$Mode)
     if ($EnableAudit) { $argv += '-EnableAudit' }
     if ($At -ne [datetime]::MinValue) { $argv += @('-At',('"' + $At.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
+    if ($DetectionAt -ne [datetime]::MinValue) { $argv += @('-DetectionAt',('"' + $DetectionAt.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
+    if ($TargetImage) { $argv += @('-TargetImage',('"' + $TargetImage + '"')) }
     $result = Start-Process -FilePath $PSExe -ArgumentList ($argv -join ' ') -Verb RunAs -Wait -PassThru
     if ($result.ExitCode -ne 0) { throw "Elevated child exited with code $($result.ExitCode)" }
     exit 0
@@ -145,10 +149,118 @@ function Get-Event4688([datetime]$From, [datetime]$To) {
     return [pscustomobject]@{Rows=@($rows.ToArray()); Error=$errorText; Truncated=($events.Count -ge 3000)}
 }
 
-function Capture-Incident([datetime]$When,[string]$Reason) {
+# Process IDs in 4688 are hexadecimal strings; normalise them before joining
+# creation events. This is an event-time join, not a current-process snapshot.
+function Convert-PidKey([string]$Value) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    try {
+        if ($Value -match '^0x[0-9a-fA-F]+$') {
+            return ([Convert]::ToUInt64($Value.Substring(2),16)).ToString()
+        }
+        if ($Value -match '^[0-9]+$') { return ([UInt64]::Parse($Value)).ToString() }
+    } catch { }
+    return $null
+}
+
+function Get-ProcessChains([object[]]$Events,[datetime]$Anchor,[string]$TargetImage) {
+    # Generic candidate selection: a caller may supply the alert's reported
+    # executable (any name). Without it, show nearby process starts only.
+    $ordered = @($Events | Where-Object { $_.At -and $_.Process } |
+        Sort-Object { [datetime]$_.At })
+    $byPid = @{}
+    foreach($item in $ordered) {
+        $key = Convert-PidKey ([string]$item.ProcessIdHex)
+        if(-not $key) { continue }
+        if(-not $byPid.ContainsKey($key)) {
+            $byPid[$key] = New-Object 'System.Collections.Generic.List[object]'
+        }
+        $byPid[$key].Add($item)
+    }
+    $selection = @(
+        foreach($item in $ordered) {
+            $delta = (([datetime]$item.At) - $Anchor).TotalSeconds
+            if ([math]::Abs($delta) -gt 30) { continue }
+            if ($TargetImage) {
+                $leaf = [IO.Path]::GetFileName([string]$item.Process)
+                if (-not [string]::Equals($leaf,$TargetImage,[StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+            } elseif ([math]::Abs($delta) -gt 5) {
+                continue
+            }
+            [pscustomobject]@{Event=$item;DeltaSeconds=[math]::Round($delta,3)}
+        }
+    )
+    $selection = @($selection | Sort-Object {
+        [math]::Abs($_.DeltaSeconds)
+    } | Select-Object -First 40)
+    $out = New-Object 'System.Collections.Generic.List[object]'
+    foreach($candidate in $selection) {
+        $trace = New-Object 'System.Collections.Generic.List[object]'
+        $current = $candidate.Event
+        $seen = @{}
+        $unresolved = $null
+        for($depth=0;$depth -lt 8 -and $null -ne $current;$depth++) {
+            $recordKey = [string]$current.EventRecordId
+            if($seen.ContainsKey($recordKey)) { break }
+            $seen[$recordKey] = $true
+            $trace.Add([pscustomobject]@{
+                At=$current.At
+                EventRecordId=$current.EventRecordId
+                Process=$current.Process
+                PID=$current.ProcessIdHex
+                Parent=$current.Parent
+                ParentPID=$current.ParentIdHex
+                CommandLine=$current.CommandLine
+            })
+            $parentKey = Convert-PidKey ([string]$current.ParentIdHex)
+            if(-not $parentKey) { $unresolved=$current.Parent; break }
+            if(-not $byPid.ContainsKey($parentKey)) { $unresolved=$current.Parent; break }
+            $older = @($byPid[$parentKey] | Where-Object {
+                ([datetime]$_.At) -le ([datetime]$current.At) -and
+                ([datetime]$_.At) -ge ([datetime]$current.At).AddHours(-4)
+            } | Sort-Object { [datetime]$_.At } -Descending | Select-Object -First 1)
+            if($older.Count -eq 0) { $unresolved=$current.Parent; break }
+            # PID reuse guard: the 4688 parent's image path must agree with the
+            # actual recorded name if both are supplied.
+            if($current.Parent -and $older[0].Process -and
+               -not [string]::Equals([string]$current.Parent,[string]$older[0].Process,[StringComparison]::OrdinalIgnoreCase)) {
+                $unresolved=$current.Parent
+                break
+            }
+            $current = $older[0]
+        }
+        $chain = @($trace.ToArray())
+        [array]::Reverse($chain)
+        $out.Add([pscustomobject]@{
+            DeltaSeconds=$candidate.DeltaSeconds
+            EventRecordId=$candidate.Event.EventRecordId
+            Process=$candidate.Event.Process
+            PID=$candidate.Event.ProcessIdHex
+            Parent=$candidate.Event.Parent
+            CommandLine=$candidate.Event.CommandLine
+            Chain=$chain
+            UnresolvedParent=$unresolved
+            Interpretation='PROCESS_START_PROXIMITY_AND_4688_ANCESTRY_ONLY_NOT_AVAST_CAUSALITY'
+        })
+    }
+    return [pscustomobject]@{
+        TargetImage=if($TargetImage){$TargetImage}else{$null}
+        SelectedCount=$out.Count
+        Truncated=($selection.Count -ge 40)
+        Candidates=$out.ToArray()
+        Evidence='Windows Security Event 4688; PID + preceding timestamp + parent image path'
+        Attribution='Not established without an Avast event-to-process identifier or controlled reproduction'
+    }
+}
+
+function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='', [datetime]$DetectionAt=[datetime]::MinValue) {
     Ensure-Folder
-    $from = $When.AddMinutes(-3)
-    $to = $When.AddMinutes(3)
+    # -When is a human-observed popup time, NOT necessarily Avast detection time.
+    $anchor = $When
+    if($DetectionAt -ne [datetime]::MinValue) { $anchor = $DetectionAt }
+    $from = $anchor.AddMinutes(-3)
+    $to = $anchor.AddMinutes(3)
     $id = $env:COMPUTERNAME + '-' + (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
     $dest = Join-Path $Root ('incident-' + $id + '.json')
     $processRows = New-Object 'System.Collections.Generic.List[object]'
@@ -163,6 +275,7 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
         }
     }
     $security = Get-Event4688 -From $from -To $to
+    $correlations = Get-ProcessChains -Events $security.Rows -Anchor $anchor -TargetImage $TargetImage
     $avastMatches = New-Object 'System.Collections.Generic.List[object]'
     $fileInventory = New-Object 'System.Collections.Generic.List[object]'
     foreach($file in @(Get-AvastFiles)) {
@@ -200,8 +313,13 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
         }
     } catch { $signature = [pscustomobject]@{Error=$_.Exception.Message} }
     $report = [pscustomobject]@{
-        Version='1.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
-        AlertAt=$When.ToString('o'); WindowFrom=$from.ToString('o');WindowTo=$to.ToString('o')
+        Version='1.1.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
+        AlertAt=$When.ToString('o') # deprecated: observation only, NOT proven detection
+        PopupObservedAt=$When.ToString('o')
+        AvastDetectionAt=if($DetectionAt -ne [datetime]::MinValue){$DetectionAt.ToString('o')}else{$null}
+        DetectionTimestampStatus=if($DetectionAt -ne [datetime]::MinValue){'SUPPLIED_NOT_INDEPENDENTLY_VERIFIED'}else{'UNKNOWN'}
+        AnalysisAnchorAt=$anchor.ToString('o')
+        WindowFrom=$from.ToString('o');WindowTo=$to.ToString('o')
         Trigger=$Reason; WindowsConhost=$signature
         Security4688=[pscustomobject]@{
             Count=$security.Rows.Count; Error=$security.Error
@@ -210,11 +328,14 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
             Records=$security.Rows
         }
         WMIProcessStarts=$processRows.ToArray()
+        ProcessCorrelation=$correlations
         AvastFileInventory=$fileInventory.ToArray()
         AvastKeywordMatches=@($avastMatches.ToArray() | Select-Object -First 250)
         LiveProcesses=$live
         Limitations=@(
           'Keyword matches in Avast logs are NOT proof that a given process caused a block.',
+          'Popup observation time may be later than actual detection; an unknown Avast detection time is never inferred.',
+          'A PID-based ancestor chain with nearby timestamps is a candidate, not a confirmed Avast trigger.',
           'If 4688 auditing was disabled at the event time, historical command lines cannot be reconstructed.',
           'Avast internal detection rules are not necessarily included in its plaintext log files.',
           'Very short-lived or pre-execution-blocked processes may not appear in WMI logs.'
@@ -229,7 +350,10 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
     $conhosts = @($security.Rows | Where-Object { $_.Process -match '(?i)\\conhost\.exe$' })
     $summary = New-Object 'System.Collections.Generic.List[string]'
     $summary.Add("HOST: $env:COMPUTERNAME")
-    $summary.Add("ALERT: $($When.ToString('o')) | $Reason")
+    $summary.Add("POPUP OBSERVED: $($When.ToString('o')) | $Reason")
+    $summary.Add("AVAST DETECTION TIME: $(if($DetectionAt -ne [datetime]::MinValue){$DetectionAt.ToString('o')}else{'UNKNOWN (popup may be delayed)'})")
+    $summary.Add("TARGET IMAGE: $(if($TargetImage){$TargetImage}else{'unspecified; nearest process starts shown'})")
+    $summary.Add("CORRELATION: CANDIDATES ONLY (never an attribution verdict)")
     $summary.Add("Window: $($from.ToString('o')) to $($to.ToString('o'))")
     $summary.Add("4688 Count: $($security.Rows.Count); Command lines present: $(@($security.Rows | Where-Object { $_.CommandLine }).Count)")
     $summary.Add("WMI Starts: $($processRows.Count); Avast Matches: $($avastMatches.Count)")
@@ -244,6 +368,20 @@ function Capture-Incident([datetime]$When,[string]$Reason) {
         $summary.Add("[$($r.At)] $($r.Process) Parent=$($r.Parent) Command=$($r.CommandLine)")
     }
     $summary.Add('')
+    $summary.Add('')
+    $summary.Add('CLOSEST EXECUTION CHAINS (4688 RECORDS, NOT PROVEN AVAST CAUSE):')
+    foreach($c in @($correlations.Candidates | Select-Object -First 20)) {
+        $summary.Add("Delta=$($c.DeltaSeconds)s PID=$($c.PID) Image=$($c.Process)")
+        if($c.UnresolvedParent) {
+            $summary.Add("  Missing recorded ancestor: $($c.UnresolvedParent)")
+        }
+        foreach($step in $c.Chain) {
+            $summary.Add("  -> [$($step.At)] $($step.Process) PID=$($step.PID)")
+            if($step.CommandLine) { $summary.Add("     CMD: $($step.CommandLine)") }
+        }
+    }
+    $summary.Add('NOTE: source-code call sites cannot be recovered from 4688 alone; locate the recorded commands in project source.')
+    $summary.Add('NOTE: raw Avast keyword matches have unverified event times; 250 lines are NOT 250 detections.')
     $summary.Add('Avast text matches are only possible context, not attribution evidence.')
     $summaryPath = [IO.Path]::ChangeExtension($dest,'.summary.txt')
     [IO.File]::WriteAllLines($summaryPath,$summary.ToArray(),$Utf8)
@@ -268,11 +406,13 @@ function Scan-AvastAppend {
             $script:Offsets[$file.FullName] = [long]$chunk.Length
             if($chunk.Dropped -gt 0){ Log-Error "Skipped $($chunk.Dropped) bytes in $($file.FullName) due to unusually large log append." }
             foreach($line in @($chunk.Text -split '[\r\n]+')) {
-                if($line -match '(?i)IDP\.Generic|conhost\.exe|Behavior\s*Shield.*(block|threat|infect|detect)') {
+                if($line -match '(?i)IDP\.Generic|Behavior\s*Shield.*(block|threat|infect|detect)') {
                     Log-Json 'signals' ([pscustomobject]@{At=(Get-Date).ToString('o'); File=$file.FullName; Line=$line.Substring(0,[Math]::Min(1000,$line.Length))})
                     if(((Get-Date) - $script:LastAutoCapture).TotalSeconds -ge 60) {
                         $script:LastAutoCapture = Get-Date
-                        try { [void](Capture-Incident -When (Get-Date) -Reason ('Avast log keyword: ' + $file.Name)) }
+                        $hint = ''
+                        if($line -match '(?i)\b([a-z0-9_.-]+\.exe)\b') { $hint = $Matches[1] }
+                        try { [void](Capture-Incident -When (Get-Date) -Reason ('Avast log append observed (detection time unverified): ' + $file.Name) -TargetImage $hint) }
                         catch { Log-Error "Auto capture failed: $($_.Exception.Message)" }
                     }
                 }
@@ -415,6 +555,27 @@ function Uninstall {
     Write-Warning 'Any opt-in 4688 auditing is NOT reverted automatically; inspect audit-before-*.json before changing system policy.'
 }
 
+
+function Invoke-CorrelationSelfTest {
+    $start = [datetime]'2026-01-01T12:00:00'
+    $records = @(
+        [pscustomobject]@{At=$start.AddSeconds(-3).ToString('o');EventRecordId=11;ProcessIdHex='0x10';ParentIdHex='0x04';Process='C:\test\DemoController.exe';Parent='C:\Windows\explorer.exe';CommandLine='DemoController.exe'},
+        [pscustomobject]@{At=$start.AddSeconds(-2).ToString('o');EventRecordId=12;ProcessIdHex='0x20';ParentIdHex='0x10';Process='C:\Windows\cmd.exe';Parent='C:\test\DemoController.exe';CommandLine='cmd.exe /c npm.cmd run runtime:status'},
+        [pscustomobject]@{At=$start.AddSeconds(-1).ToString('o');EventRecordId=13;ProcessIdHex='0x30';ParentIdHex='0x20';Process='C:\Program Files\nodejs\node.exe';Parent='C:\Windows\cmd.exe';CommandLine='node scripts/runtime/runtime-manager.js status --json'},
+        [pscustomobject]@{At=$start.AddMilliseconds(250).ToString('o');EventRecordId=14;ProcessIdHex='0x40';ParentIdHex='0x30';Process='C:\Windows\conhost.exe';Parent='C:\Program Files\nodejs\node.exe';CommandLine='conhost.exe 0xffffffff -ForceV1'}
+    )
+    $result = Get-ProcessChains -Events $records -Anchor $start -TargetImage 'conhost.exe'
+    if($result.SelectedCount -ne 1) { throw 'Expected one target candidate' }
+    $chain = @($result.Candidates[0].Chain)
+    if($chain.Count -ne 4) { throw "Wrong ancestry length: $($chain.Count)" }
+    if($chain[0].CommandLine -ne 'DemoController.exe' -or
+       $chain[2].CommandLine -notmatch 'runtime-manager\.js' -or
+       $chain[3].Process -notmatch 'conhost.exe') { throw 'Expected command ancestry missing' }
+    $none = Get-ProcessChains -Events $records -Anchor $start -TargetImage 'notpresent.exe'
+    if($none.SelectedCount -ne 0) { throw 'Unexpected target false positive' }
+    Write-Host 'PASS synthetic 4688 process ancestry and target filtering'
+}
+
 try {
     switch ($Mode) {
         'Install'   { Install }
@@ -422,9 +583,10 @@ try {
         'Capture'   {
             Ensure-Admin
             if($At -eq [datetime]::MinValue){$At=Get-Date}
-            [void](Capture-Incident -When $At -Reason 'Manual capture')
+            [void](Capture-Incident -When $At -Reason 'Manual popup observation' -TargetImage $TargetImage -DetectionAt $DetectionAt)
         }
         'Status'    { Status }
+        'SelfTest' { Invoke-CorrelationSelfTest }
         'Uninstall' { Uninstall }
     }
 } catch {
