@@ -313,26 +313,50 @@ function Get-ArchivedEvent4688([datetime]$From,[datetime]$To) {
 
 function Get-Event4688([datetime]$From, [datetime]$To) {
     $events = @()
-    $errorText = $null
+    $eventLogError = $null
     try {
         $query = @{LogName='Security';Id=4688;StartTime=$From;EndTime=$To}
         $events = @(Get-WinEvent -FilterHashtable $query -MaxEvents 3000 -ErrorAction Stop)
-    } catch { $errorText = $_.Exception.Message }
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($ev in $events) {
-        try {
-            $xml = [xml]$ev.ToXml()
-            $v = @{}
-            foreach ($field in $xml.Event.EventData.Data) { $v[[string]$field.GetAttribute('Name')] = [string]$field.InnerText }
-            $rows.Add([pscustomobject]@{
-                At=$ev.TimeCreated.ToString('o'); EventRecordId=$ev.RecordId
-                ProcessIdHex=$v['NewProcessId']; Process=$v['NewProcessName']
-                ParentIdHex=$v['ProcessId']; Parent=$v['ParentProcessName']
-                CommandLine=$v['CommandLine']; User=$v['SubjectUserName']
-            })
-        } catch { }
+    } catch {
+        $eventLogError = $_.Exception.Message
     }
-    return [pscustomobject]@{Rows=@($rows.ToArray()); Error=$errorText; Truncated=($events.Count -ge 3000)}
+    $archive = Get-ArchivedEvent4688 -From $From -To $To
+    # Dedupe retries and overlap. Event record ID alone is insufficient if the
+    # Security log was cleared and IDs were reused.
+    $seen = @{}
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $liveCount = 0
+    $archivedCount = 0
+    foreach($entry in @($archive.Rows) + @(
+        foreach($ev in $events) {
+            try { Convert-Security4688 -Event $ev }
+            catch { Log-Error "4688 conversion failed in incident query: $($_.Exception.Message)" }
+        }
+    )) {
+        if($null -eq $entry -or -not $entry.At) { continue }
+        $key = ([string]$entry.EventRecordId) + ':' + ([string]$entry.At)
+        if($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $rows.Add($entry)
+        if($entry.Source -eq 'Security4688') { $liveCount++ } else { $archivedCount++ }
+    }
+    # Event-log and archive share the same normalized shape, preserving
+    # original command lines when the Windows Security ring buffer has rolled.
+    $ordered = @($rows.ToArray() | Sort-Object { [datetime]$_.At })
+    $errorText = $null
+    if($ordered.Count -eq 0) {
+        $errorText = if($eventLogError){$eventLogError}else{'No Security 4688 or retained archive evidence in selected period'}
+    }
+    return [pscustomobject]@{
+        Rows=$ordered
+        Error=$errorText
+        EventLogError=$eventLogError
+        ArchiveError=$archive.Error
+        Truncated=($events.Count -ge 3000 -or $archive.Truncated)
+        ArchiveRecordCount=$archivedCount
+        LiveRecordCount=$liveCount
+        PreservationEnabled=(Read-CollectorConfig).Preserve4688
+    }
 }
 
 # Process IDs in 4688 are hexadecimal strings; normalise them before joining
@@ -469,6 +493,7 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     $avastMatches = New-Object 'System.Collections.Generic.List[object]'
     $fileInventory = New-Object 'System.Collections.Generic.List[object]'
     foreach($file in @(Get-AvastFiles)) {
+        if($avastMatches.Count -ge 250) { break }
         try {
             if($file.LastWriteTime -lt $When.AddDays(-2)) { continue }
             $chunk = Read-FileBytes -Path $file.FullName -Start 0 -MaxBytes 2097152
@@ -509,7 +534,7 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
         }
     } catch { $signature = [pscustomobject]@{Error=$_.Exception.Message} }
     $report = [pscustomobject]@{
-        Version='1.1.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
+        Version='1.2.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
         AlertAt=$When.ToString('o') # deprecated: observed reference, NOT proven detection
         ReferenceObservedAt=$When.ToString('o')
         ObservationType=$observationType
@@ -522,6 +547,11 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
         Trigger=$Reason; WindowsConhost=$signature
         Security4688=[pscustomobject]@{
             Count=$security.Rows.Count; Error=$security.Error
+            EventLogError=$security.EventLogError
+            ArchiveError=$security.ArchiveError
+            ArchiveRecordCount=$security.ArchiveRecordCount
+            LiveRecordCount=$security.LiveRecordCount
+            PreservationEnabled=$security.PreservationEnabled
             Truncated=$security.Truncated
             CommandLineCount=@($security.Rows | Where-Object { $_.CommandLine }).Count
             Records=$security.Rows
@@ -536,6 +566,8 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
           'Popup observation time may be later than actual detection; an unknown Avast detection time is never inferred.',
           'A PID-based ancestor chain with nearby timestamps is a candidate, not a confirmed Avast trigger.',
           'Auto-incident observations are Avast log append times, not popup sightings.',
+          'Archived Security event 4688 command lines can contain secrets; do not share raw evidence publicly.',
+          'A 4688 archive begins only after explicit Preserve4688 opt-in; already overwritten Security events cannot be recovered.'
           'If 4688 auditing was disabled at the event time, historical command lines cannot be reconstructed.',
           'Avast internal detection rules are not necessarily included in its plaintext log files.',
           'Very short-lived or pre-execution-blocked processes may not appear in WMI logs.'
@@ -557,6 +589,9 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     $summary.Add("CORRELATION: CANDIDATES ONLY (never an attribution verdict)")
     $summary.Add("Window: $($from.ToString('o')) to $($to.ToString('o'))")
     $summary.Add("4688 Count: $($security.Rows.Count); Command lines present: $(@($security.Rows | Where-Object { $_.CommandLine }).Count)")
+    $summary.Add("4688 preservation enabled: $($security.PreservationEnabled); archived unique: $($security.ArchiveRecordCount); Security live unique: $($security.LiveRecordCount)")
+    if($security.EventLogError){ $summary.Add("Current Windows Security log: $($security.EventLogError)") }
+    if($security.ArchiveError){ $summary.Add("Archived evidence: $($security.ArchiveError)") }
     $summary.Add("WMI Starts: $($processRows.Count); Avast Matches: $($avastMatches.Count)")
     $summary.Add('')
     $summary.Add('CONHOST PROCESS CREATIONS IN +/-3 MIN (NOT automatically the cause):')
@@ -632,6 +667,9 @@ function Monitor {
     Ensure-Folder
     Write-Host "AvastTrace monitoring $env:COMPUTERNAME"
     $source = 'AvastTrace.ProcessStart'
+    $config = Read-CollectorConfig
+    $lastArchiveSweep = [datetime]::MinValue
+    $script:ArchiveQuotaWarned = $false
     try {
         Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $source -ErrorAction Stop | Out-Null
         $lastScan = [datetime]::MinValue
@@ -681,6 +719,11 @@ function Monitor {
             if(((Get-Date) - $lastScan).TotalSeconds -ge 5) {
                 Scan-AvastAppend
                 $lastScan = Get-Date
+            }
+            if($config.Preserve4688 -and ((Get-Date) - $lastArchiveSweep).TotalSeconds -ge 5) {
+                try { Preserve-Security4688 -Config $config }
+                catch { Log-Error "4688 preservation failed: $($_.Exception.Message)" }
+                $lastArchiveSweep = Get-Date
             }
             if(((Get-Date) - $lastBeat).TotalSeconds -ge 30) {
                 [IO.File]::WriteAllText((Join-Path $Root 'heartbeat.txt'), (Get-Date).ToString('o'), $Utf8)
