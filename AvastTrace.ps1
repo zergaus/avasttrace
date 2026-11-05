@@ -327,9 +327,19 @@ function Get-Event4688([datetime]$From, [datetime]$To) {
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $liveCount = 0
     $archivedCount = 0
+    # Archive entries and live events use the same fields but retain provenance.
+    foreach($entry in @($archive.Rows)) {
+        if($null -ne $entry) {
+            $entry | Add-Member -NotePropertyName EvidenceStore -NotePropertyValue 'LocalArchive' -Force
+        }
+    }
     foreach($entry in @($archive.Rows) + @(
         foreach($ev in $events) {
-            try { Convert-Security4688 -Event $ev }
+            try {
+                $current = Convert-Security4688 -Event $ev
+                $current | Add-Member -NotePropertyName EvidenceStore -NotePropertyValue 'WindowsSecurity' -Force
+                $current
+            }
             catch { Log-Error "4688 conversion failed in incident query: $($_.Exception.Message)" }
         }
     )) {
@@ -338,7 +348,7 @@ function Get-Event4688([datetime]$From, [datetime]$To) {
         if($seen.ContainsKey($key)) { continue }
         $seen[$key] = $true
         $rows.Add($entry)
-        if($entry.Source -eq 'Security4688') { $liveCount++ } else { $archivedCount++ }
+        if($entry.EvidenceStore -eq 'LocalArchive') { $archivedCount++ } else { $liveCount++ }
     }
     # Event-log and archive share the same normalized shape, preserving
     # original command lines when the Windows Security ring buffer has rolled.
