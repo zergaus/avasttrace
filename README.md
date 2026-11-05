@@ -3,7 +3,7 @@
 **Avast Behavior Shield 탐지와 Windows 프로세스 실행 기록을 연결해 조사하기 위한 로컬 진단 도구.**  
 *Local Windows diagnostics for correlating Avast alerts with process-start evidence.*
 
-> **상태: Experimental / Windows 10·11 실기기 검증 전.** 실제 탐지 원인을 자동 확정하거나 Avast의 내부 탐지 규칙을 공개하는 도구가 아닙니다.
+> **상태: Experimental / 실제 Avast 차단 E2E 미검증.** Windows GitHub CI에서 기본 수집·4단계 실행 체인 재구성·설치·보고서 생성을 확인했습니다. 내부 탐지 규칙·정확한 원인 확정 기능은 제공하지 않습니다.
 
 ## 왜 만들었나요?
 
@@ -15,6 +15,8 @@ AvastTrace는 보호 기능을 비활성화하거나 파일을 예외 처리하�
 2. Windows Security 이벤트 **4688** (활성화된 경우 명령줄 포함)
 3. Avast 로그/보고서의 새 탐지 관련 문자열
 4. `conhost.exe` 파일의 SHA-256 및 디지털 서명 상태
+
+**주요 목적: 어떤 실행 명령이 Avast 경고 시각 주변에서 실행됐는지 개발자가 바로 확인하도록 돕는 것.** 4688 명령줄과 부모 PID를 사건별 실행 체인으로 복원합니다. [사건 중심 진단 사용법](docs/INCIDENT_INVESTIGATION.md)을 먼저 확인하세요.
 
 **시간상 인접한 프로세스는 원인 '후보'일 뿐입니다.** 독립적인 재현과 추가 증거 없이는 악성코드·오탐·특정 도구의 원인 관계를 단정하지 않습니다.
 
@@ -67,8 +69,10 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 
 **정해진 시각을 기준으로 조사 (PC 로컬 시간)**
 
+Avast 팝업을 본 시각과 팝업에 표시된 실행 파일명을 입력합니다. 실제 탐지 시각과 다를 수 있습니다.
+
 ```powershell
-powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode Capture -At "2026-11-05 07:01:03"
+powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode Capture -At "2026-11-05 07:01:03" -TargetImage conhost.exe
 ```
 
 탐지 시간 기준 **전후 3분**의 기록을 연결합니다. 현재 시각으로 실행한 `Capture`는 실제 팝업이 발생한 시각이 아닌 **명령 실행 시각**을 중심으로 분석하므로, 늦게 실행했다면 반드시 `-At`으로 시간을 지정하세요.
@@ -87,6 +91,7 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 | --- | --- |
 | `process-YYYYMMDD.jsonl` | WMI 프로세스 시작 시각(`At`), 수신 시각(`ObservedAt`), 큐 지연, PID·부모 PID (명령줄은 4688 활용) |
 | `signals-YYYYMMDD.jsonl` | 변경된 Avast 텍스트 로그의 탐지 키워드 |
+| `ProcessCorrelation` (incident JSON) | 4688 기반 주변 프로세스 실행 명령 및 부모 실행 체인 (인과관계 아님) |
 | `incident-*.json` | 관련 이벤트·Avast 문자열·실행 프로세스의 조사 자료 |
 | `incident-*.summary.txt` | 사람이 읽는 요약 |
 | `errors-YYYYMMDD.jsonl` | 수집 오류 |
@@ -112,7 +117,7 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 
 ## 검증 범위
 
-- **수행:** PowerShell 5.1 구문 분석, SHA-256 검사, Windows CI에서 합성 Avast 탐지 보고서 생성, GitHub 업로드 및 재조회
+- **수행:** PowerShell 5.1 구문 분석, SHA-256 검사, 합성 4단계 부모·자식 4688 체인 복원, 합성 Avast 탐지 보고서 생성, Windows CI 설치·예약 작업 등록 검증, GitHub 업로드 및 재조회
 - **미수행:** 실제 Windows 10/11 + Avast에서 WMI 수집, 예약 작업 실행, 관리자 UAC 동작, 4688 활성화·복구, 실제 IDP.Generic 탐지 E2E
 - **권고:** 첫 장비에서 비관리자 설치 상태 → `Status` → 테스트 프로세스 관찰 → `Capture` → `Uninstall` 순으로 확인하고 나머지 장비에 적용
 
