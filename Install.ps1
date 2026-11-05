@@ -4,8 +4,7 @@
 [CmdletBinding()]
 param(
     [switch]$EnableAudit,
-    [switch]$Preserve4688,
-    [switch]$CompactLogs
+    [switch]$Preserve4688
 )
 
 $ErrorActionPreference = 'Stop'
@@ -56,7 +55,6 @@ try {
                    $collector, '-Mode', 'Install')
     if ($EnableAudit) { $arguments += '-EnableAudit' }
     if ($Preserve4688) { $arguments += '-Preserve4688' }
-    if ($CompactLogs) { $arguments += '-CompactLogs' }
     & $exe @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Collector installer failed with exit code $LASTEXITCODE"
