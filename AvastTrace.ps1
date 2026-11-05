@@ -196,9 +196,114 @@ function Save-4688Cursor([long]$RecordId) {
     [IO.File]::WriteAllText($ArchiveCursorPath,(ConvertTo-Json $state -Compress),$Utf8)
 }
 
+# Closed-day GZIP conversion (opt-in). Reversible byte-for-byte after
+# SHA-256 verification; no daily source file is removed before verification.
+# The active day is NEVER compacted while Monitor may still append to it.
+function Test-GzipOriginalHash([string]$Compressed,[string]$ExpectedSha256) {
+    $file = $null
+    $gz = $null
+    $sha = $null
+    try {
+        $file = [IO.File]::Open($Compressed,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $gz = [IO.Compression.GZipStream]::new($file,[IO.Compression.CompressionMode]::Decompress,$false)
+        $sha = [Security.Cryptography.SHA256]::Create()
+        $actual = [BitConverter]::ToString($sha.ComputeHash($gz)).Replace('-','')
+        return [string]::Equals($actual,$ExpectedSha256,[StringComparison]::OrdinalIgnoreCase)
+    } finally {
+        if($null -ne $sha) { $sha.Dispose() }
+        if($null -ne $gz) { $gz.Dispose() }
+        if($null -ne $file) { $file.Dispose() }
+    }
+}
+
+function Compress-OneFinalizedLog([string]$Path) {
+    $name = [IO.Path]::GetFileName($Path)
+    if($name -notmatch '^(process|security4688)-([0-9]{8})\.jsonl$') {
+        throw "Unexpected compaction target name: $name"
+    }
+    $day = [datetime]::ParseExact($Matches[2],'yyyyMMdd',[Globalization.CultureInfo]::InvariantCulture)
+    if($day -ge (Get-Date).Date) { throw "Never compact an active-day log: $name" }
+    $target = $Path + '.gz'
+    $temp = $target + '.tmp'
+    $expected = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    if(Test-Path -LiteralPath $target) {
+        if(-not (Test-GzipOriginalHash -Compressed $target -ExpectedSha256 $expected)) {
+            throw "Existing compressed log does not match source: $target"
+        }
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $target
+    }
+    if(Test-Path -LiteralPath $temp) {
+        # Previous interruption: never assume an incomplete temporary gzip is valid.
+        Remove-Item -LiteralPath $temp -Force -ErrorAction Stop
+    }
+    $reader = $null; $writer = $null; $compressor = $null
+    try {
+        $reader = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $writer = [IO.File]::Open($temp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $compressor = [IO.Compression.GZipStream]::new($writer,[IO.Compression.CompressionMode]::Compress,$false)
+        $reader.CopyTo($compressor)
+    } finally {
+        if($null -ne $compressor) { $compressor.Dispose() }
+        if($null -ne $writer) { $writer.Dispose() }
+        if($null -ne $reader) { $reader.Dispose() }
+    }
+    if(-not (Test-GzipOriginalHash -Compressed $temp -ExpectedSha256 $expected)) {
+        throw "Post-compression SHA256 validation failed; original retained: $Path"
+    }
+    [IO.File]::Move($temp,$target)
+    # Avoid deleting bytes if someone changed the original during compaction.
+    $still = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    if($still -ne $expected) { throw "Source changed during compression; source retained: $Path" }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    return $target
+}
+
+function Compact-FinalizedLogs([int]$MaxFiles=2) {
+    if($MaxFiles -lt 1) { return }
+    $today=(Get-Date).Date
+    $count=0
+    foreach($file in @(Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(process|security4688)-[0-9]{8}\.jsonl$' } |
+        Sort-Object LastWriteTime)) {
+        if($count -ge $MaxFiles) { break }
+        if($file.Name -notmatch '^(process|security4688)-([0-9]{8})\.jsonl$') { continue }
+        $day=[datetime]::ParseExact($Matches[2],'yyyyMMdd',[Globalization.CultureInfo]::InvariantCulture)
+        if($day -ge $today) { continue }
+        try {
+            $packed=Compress-OneFinalizedLog -Path $file.FullName
+            Write-Host "Verified archive: $packed"
+        } catch {
+            Log-Error "Log compaction failed for $($file.Name): $($_.Exception.Message)"
+        }
+        $count++
+    }
+}
+
+# Returns a lazy stream of lines. The caller can read both finalized .gz
+# and active .jsonl files without expanding compressed logs onto disk.
+function Read-LogTextLines([string]$Path) {
+    if(-not $Path.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)) {
+        foreach($line in [IO.File]::ReadLines($Path)) { Write-Output $line }
+        return
+    }
+    $raw=$null; $gz=$null; $reader=$null
+    try {
+        $raw=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $gz=[IO.Compression.GZipStream]::new($raw,[IO.Compression.CompressionMode]::Decompress,$false)
+        $reader=[IO.StreamReader]::new($gz,[Text.Encoding]::UTF8,$true)
+        while(-not $reader.EndOfStream) { Write-Output $reader.ReadLine() }
+    } finally {
+        if($null -ne $reader) { $reader.Dispose() }
+        if($null -ne $gz) { $gz.Dispose() }
+        if($null -ne $raw) { $raw.Dispose() }
+    }
+}
+
 function Get-ArchiveSize {
     $total = [long]0
-    foreach($file in @(Get-ChildItem -LiteralPath $Root -Filter 'security4688-*.jsonl' -File -ErrorAction SilentlyContinue)) {
+    foreach($file in @(Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^security4688-[0-9]{8}\.jsonl(\.gz)?$' })) {
         $total += [long]$file.Length
     }
     return $total
@@ -290,9 +395,10 @@ function Get-ArchivedEvent4688([datetime]$From,[datetime]$To) {
     $limited = $false
     for($date=$From.Date;$date -le $To.Date;$date=$date.AddDays(1)) {
         $file=Join-Path $Root ('security4688-' + $date.ToString('yyyyMMdd') + '.jsonl')
+        if(-not (Test-Path -LiteralPath $file)) { $file += '.gz' }
         if(-not (Test-Path -LiteralPath $file)) { continue }
         try {
-            foreach($line in [IO.File]::ReadLines($file)) {
+            foreach($line in (Read-LogTextLines -Path $file)) {
                 if([string]::IsNullOrWhiteSpace($line)) { continue }
                 try {
                     $item = ConvertFrom-Json -InputObject $line -ErrorAction Stop
@@ -492,15 +598,20 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     $id = $env:COMPUTERNAME + '-' + (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
     $dest = Join-Path $Root ('incident-' + $id + '.json')
     $processRows = New-Object 'System.Collections.Generic.List[object]'
-    foreach($file in @(Get-ChildItem -LiteralPath $Root -Filter 'process-*.jsonl' -ErrorAction SilentlyContinue |
-                   Sort-Object LastWriteTime -Descending | Select-Object -First 3)) {
-        foreach($line in @(Get-Content -LiteralPath $file.FullName -Tail 15000 -ErrorAction SilentlyContinue)) {
-            try {
-                $r = ConvertFrom-Json -InputObject $line -ErrorAction Stop
-                $t = [datetime]$r.At
-                if($t -ge $from -and $t -le $to) { $processRows.Add($r) }
-            } catch { }
-        }
+    for($day=$from.Date;$day -le $to.Date;$day=$day.AddDays(1)) {
+        $path=Join-Path $Root ('process-' + $day.ToString('yyyyMMdd') + '.jsonl')
+        if(-not (Test-Path -LiteralPath $path)) { $path += '.gz' }
+        if(-not (Test-Path -LiteralPath $path)) { continue }
+        try {
+            foreach($line in (Read-LogTextLines -Path $path)) {
+                try {
+                    $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+                    $t = [datetime]$entry.At
+                    if($t -ge $from -and $t -le $to) { $processRows.Add($entry) }
+                } catch { }
+                if($processRows.Count -ge 20000) { break }
+            }
+        } catch { Log-Error "Process history read failed for $path : $($_.Exception.Message)" }
     }
     $security = Get-Event4688 -From $from -To $to
     $correlations = Get-ProcessChains -Events $security.Rows -Anchor $anchor -TargetImage $TargetImage
