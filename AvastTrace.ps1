@@ -256,7 +256,11 @@ function Get-ProcessChains([object[]]$Events,[datetime]$Anchor,[string]$TargetIm
 
 function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='', [datetime]$DetectionAt=[datetime]::MinValue) {
     Ensure-Folder
-    # -When is a human-observed popup time, NOT necessarily Avast detection time.
+    # Manual Capture: -When is a user-reported popup time.
+    # Auto Capture: -When is when a new Avast LOG APPEND was observed.
+    # Neither time is guaranteed to be Avast's underlying detection time.
+    $observationType = 'MANUAL_POPUP_REPORTED'
+    if($Reason -like 'Avast log append observed*') { $observationType='AVAST_LOG_APPEND_OBSERVED' }
     $anchor = $When
     if($DetectionAt -ne [datetime]::MinValue) { $anchor = $DetectionAt }
     $from = $anchor.AddMinutes(-3)
@@ -285,7 +289,13 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
             $fileInventory.Add([pscustomobject]@{File=$file.FullName; LastWrite=$file.LastWriteTime.ToString('o'); Bytes=$file.Length; TailTruncated=($file.Length -gt 2097152)})
             foreach($line in @($chunk.Text -split '[\r\n]+')) {
                 if($line -match '(?i)IDP\.Generic|conhost\.exe|Behavior\s*Shield|blocked\b|threat\b') {
-                    $avastMatches.Add([pscustomobject]@{File=$file.FullName; Line=$line.Substring(0,[Math]::Min(1000,$line.Length))})
+                    $avastMatches.Add([pscustomobject]@{
+                        File=$file.FullName
+                        Line=$line.Substring(0,[Math]::Min(1000,$line.Length))
+                        DetectionAt=$null
+                        TimestampReliability='UNKNOWN_UNPARSED_RAW_LINE'
+                        LastWriteObserved=$file.LastWriteTime.ToString('o')
+                    })
                     if($avastMatches.Count -ge 250) { break }
                 }
             }
@@ -314,8 +324,11 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     } catch { $signature = [pscustomobject]@{Error=$_.Exception.Message} }
     $report = [pscustomobject]@{
         Version='1.1.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
-        AlertAt=$When.ToString('o') # deprecated: observation only, NOT proven detection
-        PopupObservedAt=$When.ToString('o')
+        AlertAt=$When.ToString('o') # deprecated: observed reference, NOT proven detection
+        ReferenceObservedAt=$When.ToString('o')
+        ObservationType=$observationType
+        PopupObservedAt=if($observationType -eq 'MANUAL_POPUP_REPORTED'){$When.ToString('o')}else{$null}
+        AvastLogAppendObservedAt=if($observationType -eq 'AVAST_LOG_APPEND_OBSERVED'){$When.ToString('o')}else{$null}
         AvastDetectionAt=if($DetectionAt -ne [datetime]::MinValue){$DetectionAt.ToString('o')}else{$null}
         DetectionTimestampStatus=if($DetectionAt -ne [datetime]::MinValue){'SUPPLIED_NOT_INDEPENDENTLY_VERIFIED'}else{'UNKNOWN'}
         AnalysisAnchorAt=$anchor.ToString('o')
@@ -336,6 +349,7 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
           'Keyword matches in Avast logs are NOT proof that a given process caused a block.',
           'Popup observation time may be later than actual detection; an unknown Avast detection time is never inferred.',
           'A PID-based ancestor chain with nearby timestamps is a candidate, not a confirmed Avast trigger.',
+          'Auto-incident observations are Avast log append times, not popup sightings.',
           'If 4688 auditing was disabled at the event time, historical command lines cannot be reconstructed.',
           'Avast internal detection rules are not necessarily included in its plaintext log files.',
           'Very short-lived or pre-execution-blocked processes may not appear in WMI logs.'
@@ -350,7 +364,8 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     $conhosts = @($security.Rows | Where-Object { $_.Process -match '(?i)\\conhost\.exe$' })
     $summary = New-Object 'System.Collections.Generic.List[string]'
     $summary.Add("HOST: $env:COMPUTERNAME")
-    $summary.Add("POPUP OBSERVED: $($When.ToString('o')) | $Reason")
+    $summary.Add("REFERENCE OBSERVED: $($When.ToString('o')) | $Reason")
+    $summary.Add("OBSERVATION TYPE: $observationType (NOT verified detection time)")
     $summary.Add("AVAST DETECTION TIME: $(if($DetectionAt -ne [datetime]::MinValue){$DetectionAt.ToString('o')}else{'UNKNOWN (popup may be delayed)'})")
     $summary.Add("TARGET IMAGE: $(if($TargetImage){$TargetImage}else{'unspecified; nearest process starts shown'})")
     $summary.Add("CORRELATION: CANDIDATES ONLY (never an attribution verdict)")
@@ -407,7 +422,13 @@ function Scan-AvastAppend {
             if($chunk.Dropped -gt 0){ Log-Error "Skipped $($chunk.Dropped) bytes in $($file.FullName) due to unusually large log append." }
             foreach($line in @($chunk.Text -split '[\r\n]+')) {
                 if($line -match '(?i)IDP\.Generic|Behavior\s*Shield.*(block|threat|infect|detect)') {
-                    Log-Json 'signals' ([pscustomobject]@{At=(Get-Date).ToString('o'); File=$file.FullName; Line=$line.Substring(0,[Math]::Min(1000,$line.Length))})
+                    Log-Json 'signals' ([pscustomobject]@{
+                        ObservedAt=(Get-Date).ToString('o')
+                        DetectionAt=$null
+                        TimestampReliability='UNKNOWN_UNPARSED_RAW_LINE'
+                        File=$file.FullName
+                        Line=$line.Substring(0,[Math]::Min(1000,$line.Length))
+                    })
                     if(((Get-Date) - $script:LastAutoCapture).TotalSeconds -ge 60) {
                         $script:LastAutoCapture = Get-Date
                         $hint = ''
