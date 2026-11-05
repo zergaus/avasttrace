@@ -41,6 +41,30 @@ if ($LASTEXITCODE -ne 0) { throw 'AvastTrace installation failed' }
 - **기본 설치는 Windows 감사 정책을 변경하지 않습니다.** 더 정확한 명령줄 증거가 필요할 때만 아래 선택적 설정을 적용합니다.
 - `main` 브랜치는 업데이트될 수 있습니다. 운영환경에서는 실행 전에 [소스](AvastTrace.ps1)와 [설치 스크립트](Install.ps1)를 검토하세요. **매니페스트와 코드가 같은 저장소에서 제공되므로 SHA-256 검사는 단독으로 게시자 신뢰를 보장하지는 않습니다.**
 
+### 권장: 이벤트 소실 방지용 4688 로컬 보존 (명시적 선택)
+
+Windows 보안 이벤트 로그(Security.evtx)는 기록량에 따라 오래된 4688 실행 기록이 덮어써질 수 있습니다. **AvastTrace v1.2.0부터** 명령줄 증거를 별도의 관리자 전용 JSONL 파일에 보존하는 기능을 추가했습니다. **기본 설치에서는 꺼져 있습니다.**
+
+최초 설치에서 Windows 4688 감사와 로컬 보존을 모두 사용하려면:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\AvastTrace-Install.ps1" -EnableAudit -Preserve4688
+```
+
+이미 감사가 켜진 PC에서 기존 수집기를 교체하면서 보존만 추가하려면:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\AvastTrace-Install.ps1" -Preserve4688
+```
+
+- 보존 파일: `C:\ProgramData\AvastTrace\security4688-YYYYMMDD.jsonl`, 마지막 기록 커서: `security4688-cursor.json`, 선택 상태: `config.json`.
+- 크기 제한: **총 512 MiB**. 초과하면 기존 증거를 임의로 지우지 않고 **추가 보존을 중단하고 오류를 기록**합니다. 디스크 사용량을 확인해야 합니다.
+- 최초 활성화 시 최근 약 10분간 Security 이벤트부터 보존을 시도합니다. 이미 덮어쓴 기록은 복구할 수 없습니다.
+- **보안:** 모든 실행 명령줄이 평문으로 저장될 수 있고 비밀번호·토큰이 포함될 수 있습니다. 관리자/SYSTEM 이외의 접근을 허용하지 않도록 설계했으며, 공개 저장소나 이슈에 원본 로그를 업로드하면 안 됩니다.
+- 설치기의 `-Preserve4688` 선택은 재설치해도 유지되며, 수집기 예약 작업을 제거하면 보존도 중단됩니다. 기존 보존 파일과 감사 정책은 자동 삭제하지 않습니다.
+
+사건 분석 시 보존본이 있으면 Security.evtx 기록이 순환 삭제된 후에도 `ProcessCorrelation`의 실행 체인에 이용합니다. **보존을 켜는 시점 이전에 소실된 명령은 재구성할 수 없습니다.**
+
 ### 선택: Windows 4688 명령줄 감사 켜기
 
 ```powershell
@@ -89,6 +113,7 @@ powershell.exe -NoProfile -File "C:\ProgramData\AvastTrace\AvastTrace.ps1" -Mode
 
 | 파일 | 의미 |
 | --- | --- |
+| `security4688-YYYYMMDD.jsonl` | 선택한 경우 별도 보존되는 Windows 4688 명령줄·부모 PID 등 (민감 정보 포함) |
 | `process-YYYYMMDD.jsonl` | WMI 프로세스 시작 시각(`At`), 수신 시각(`ObservedAt`), 큐 지연, PID·부모 PID (명령줄은 4688 활용) |
 | `signals-YYYYMMDD.jsonl` | 변경된 Avast 텍스트 로그의 탐지 키워드 |
 | `ProcessCorrelation` (incident JSON) | 4688 기반 주변 프로세스 실행 명령 및 부모 실행 체인 (인과관계 아님) |
