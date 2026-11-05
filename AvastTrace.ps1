@@ -1,4 +1,4 @@
-# AvastTrace v1.2.0 - Windows PowerShell 5.1, Windows 10/11
+# AvastTrace v1.3.0 - Windows PowerShell 5.1, Windows 10/11
 # Purpose: observe process starts and correlate them with Avast log changes.
 # This is a read-only collector except for its own files, scheduled task, and
 # the optional -EnableAudit flag. It never disables or excludes protection.
@@ -8,6 +8,7 @@ param(
     [string]$Mode = 'Install',
     [switch]$EnableAudit,
     [switch]$Preserve4688,
+    [switch]$CompactLogs,
     [datetime]$At = [datetime]::MinValue,
     [datetime]$DetectionAt = [datetime]::MinValue,
     [string]$TargetImage = ''
@@ -43,6 +44,7 @@ function Ensure-Admin {
     $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'),'-Mode',$Mode)
     if ($EnableAudit) { $argv += '-EnableAudit' }
     if ($Preserve4688) { $argv += '-Preserve4688' }
+    if ($CompactLogs) { $argv += '-CompactLogs' }
     if ($At -ne [datetime]::MinValue) { $argv += @('-At',('"' + $At.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($DetectionAt -ne [datetime]::MinValue) { $argv += @('-DetectionAt',('"' + $DetectionAt.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($TargetImage) { $argv += @('-TargetImage',('"' + $TargetImage + '"')) }
@@ -64,11 +66,12 @@ function Secure-Folder {
 }
 
 function Read-CollectorConfig {
-    $cfg = [pscustomobject]@{ Preserve4688=$false; MaxArchiveMiB=512 }
+    $cfg = [pscustomobject]@{ Preserve4688=$false; CompactLogs=$false; MaxArchiveMiB=512 }
     if(Test-Path -LiteralPath $ConfigPath) {
         try {
             $data = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
             $cfg.Preserve4688 = ($data.Preserve4688 -eq $true)
+            $cfg.CompactLogs = ($data.CompactLogs -eq $true)
             if($data.MaxArchiveMiB -ge 32 -and $data.MaxArchiveMiB -le 4096) {
                 $cfg.MaxArchiveMiB = [int]$data.MaxArchiveMiB
             }
@@ -77,9 +80,10 @@ function Read-CollectorConfig {
     return $cfg
 }
 
-function Save-CollectorConfig([bool]$Capture4688) {
+function Save-CollectorConfig([bool]$Capture4688,[bool]$EnableCompaction) {
     $json = ConvertTo-Json -InputObject ([pscustomobject]@{
         Preserve4688=$Capture4688
+        CompactLogs=$EnableCompaction
         MaxArchiveMiB=512
         SavedAt=(Get-Date).ToString('o')
     }) -Compress
@@ -544,7 +548,7 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
         }
     } catch { $signature = [pscustomobject]@{Error=$_.Exception.Message} }
     $report = [pscustomobject]@{
-        Version='1.2.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
+        Version='1.3.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
         AlertAt=$When.ToString('o') # deprecated: observed reference, NOT proven detection
         ReferenceObservedAt=$When.ToString('o')
         ObservationType=$observationType
@@ -679,6 +683,7 @@ function Monitor {
     $source = 'AvastTrace.ProcessStart'
     $config = Read-CollectorConfig
     $lastArchiveSweep = [datetime]::MinValue
+    $lastCompactSweep = [datetime]::MinValue
     $script:ArchiveQuotaWarned = $false
     try {
         Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $source -ErrorAction Stop | Out-Null
@@ -735,6 +740,11 @@ function Monitor {
                 catch { Log-Error "4688 preservation failed: $($_.Exception.Message)" }
                 $lastArchiveSweep = Get-Date
             }
+            if($config.CompactLogs -and ((Get-Date) - $lastCompactSweep).TotalMinutes -ge 15) {
+                try { Compact-FinalizedLogs -MaxFiles 2 }
+                catch { Log-Error "Daily log compaction failed: $($_.Exception.Message)" }
+                $lastCompactSweep = Get-Date
+            }
             if(((Get-Date) - $lastBeat).TotalSeconds -ge 30) {
                 [IO.File]::WriteAllText((Join-Path $Root 'heartbeat.txt'), (Get-Date).ToString('o'), $Utf8)
                 $lastBeat = Get-Date
@@ -773,7 +783,11 @@ function Install {
     if($save4688) {
         Write-Warning 'OPT-IN: preserving plaintext Security 4688 command lines in a separate, administrator-only local archive. Maximum 512 MiB. Never publish raw logs.'
     }
-    Save-CollectorConfig -Capture4688 $save4688
+    $compact = ($CompactLogs -or $existing.CompactLogs)
+    if($compact) {
+        Write-Warning 'OPT-IN: closed-day JSONL logs will be replaced by SHA-256 verified gzip archives. Original bytes remain recoverable by decompression.'
+    }
+    Save-CollectorConfig -Capture4688 $save4688 -EnableCompaction $compact
     $action = New-ScheduledTaskAction -Execute $PSExe -Argument ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptTarget + '" -Mode Monitor')
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -785,6 +799,7 @@ function Install {
     Write-Host "Scheduled task: $TaskPath$TaskName (SYSTEM, startup + started now)"
     Write-Host "Records: $Root"
     Write-Host "4688 local retention opt-in: $save4688 (audit policy unchanged unless -EnableAudit)"
+    Write-Host "Closed-day gzip compression: $compact"
     Write-Host "Check: powershell.exe -NoProfile -File `"$ScriptTarget`" -Mode Status"
 }
 
@@ -798,6 +813,7 @@ function Status {
     } catch { Write-Warning "Task unavailable: $($_.Exception.Message)" }
     $cfg = Read-CollectorConfig
     Write-Host "4688 local preservation: $($cfg.Preserve4688); max $($cfg.MaxArchiveMiB) MiB"
+    Write-Host "Closed-day gzip compression: $($cfg.CompactLogs)"
     if(Test-Path -LiteralPath $ArchiveCursorPath) {
         try { Write-Host "4688 cursor: $(Get-Content -LiteralPath $ArchiveCursorPath -Raw)" } catch {}
     }
