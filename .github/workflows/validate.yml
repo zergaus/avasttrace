@@ -70,6 +70,12 @@ jobs:
             $found = @($report.AvastKeywordMatches |
               Where-Object { $_.Line -match 'AVASTTRACE_CI_FIXTURE' })
             if ($found.Count -ne 1) { throw 'Synthetic Avast alert was not correlated into incident JSON' }
+            if ($report.ObservationType -ne 'MANUAL_POPUP_REPORTED') { throw 'Popup observation type missing' }
+            if ($null -ne $report.AvastDetectionAt) { throw 'Detection time was fabricated' }
+            if ($report.ProcessCorrelation.Attribution -notmatch 'Not established') { throw 'Unjustified attribution' }
+            if (@($report.AvastKeywordMatches | Where-Object { $_.TimestampReliability -eq 'UNKNOWN_UNPARSED_RAW_LINE' }).Count -eq 0) {
+              throw 'Unknown Avast log timestamp must be explicitly labeled'
+            }
             Write-Host "PASS synthetic capture: $($recent.Name)"
           }
           finally {
