@@ -152,6 +152,165 @@ function Get-WindowsProcess([int]$Id) {
     } catch { return $null }
 }
 
+# Local evidence retention is opt-in. 4688 command lines may contain secrets.
+# Store a bounded, separate archive so Security.evtx rollover does not erase
+# evidence needed for a later incident report. Writes are administrator/SYSTEM-only.
+function Convert-Security4688([object]$Event) {
+    $doc = [xml]$Event.ToXml()
+    $values = @{}
+    foreach($item in $doc.Event.EventData.Data) {
+        $values[[string]$item.GetAttribute('Name')] = [string]$item.InnerText
+    }
+    return [pscustomobject]@{
+        At=$Event.TimeCreated.ToString('o')
+        EventRecordId=[long]$Event.RecordId
+        ProcessIdHex=$values['NewProcessId']
+        Process=$values['NewProcessName']
+        ParentIdHex=$values['ProcessId']
+        Parent=$values['ParentProcessName']
+        CommandLine=$values['CommandLine']
+        User=$values['SubjectUserName']
+        Source='Security4688'
+    }
+}
+
+function Read-4688Cursor {
+    if(Test-Path -LiteralPath $ArchiveCursorPath) {
+        try {
+            $state = Get-Content -LiteralPath $ArchiveCursorPath -Raw | ConvertFrom-Json
+            return [long]$state.LastRecordId
+        } catch { Log-Error "4688 cursor could not be read: $($_.Exception.Message)" }
+    }
+    return [long]0
+}
+
+function Save-4688Cursor([long]$RecordId) {
+    $state = [pscustomobject]@{
+        LastRecordId=$RecordId
+        SavedAt=(Get-Date).ToString('o')
+    }
+    [IO.File]::WriteAllText($ArchiveCursorPath,(ConvertTo-Json $state -Compress),$Utf8)
+}
+
+function Get-ArchiveSize {
+    $total = [long]0
+    foreach($file in @(Get-ChildItem -LiteralPath $Root -Filter 'security4688-*.jsonl' -File -ErrorAction SilentlyContinue)) {
+        $total += [long]$file.Length
+    }
+    return $total
+}
+
+function Preserve-Security4688([object]$Config) {
+    if(-not $Config.Preserve4688) { return }
+    # Do not silently delete historical evidence when the cap is exceeded.
+    # Stop with an explicit error, retaining the cursor for later recovery.
+    if((Get-ArchiveSize) -ge ([long]$Config.MaxArchiveMiB * 1048576L)) {
+        if(-not $script:ArchiveQuotaWarned) {
+            $script:ArchiveQuotaWarned = $true
+            Log-Error "4688 preservation PAUSED: archive size has reached $($Config.MaxArchiveMiB) MiB. Do not discard evidence without review."
+        }
+        return
+    }
+    $cursor = Read-4688Cursor
+    if($cursor -le 0) {
+        # First opt-in: seed from last ten minutes, without bulk-importing an
+        # arbitrary lifetime of sensitive command lines from the Security log.
+        try {
+            $oldest = @(Get-WinEvent -FilterHashtable @{
+                LogName='Security'; Id=4688; StartTime=(Get-Date).AddMinutes(-10)
+            } -Oldest -MaxEvents 1 -ErrorAction Stop)
+            if($oldest.Count -gt 0) {
+                $cursor = [math]::Max(0L,([long]$oldest[0].RecordId - 1))
+            }
+        } catch { }
+        if($cursor -le 0) {
+            try {
+                $latest = Get-WinEvent -LogName 'Security' -MaxEvents 1 -ErrorAction Stop
+                $cursor = [long]$latest.RecordId
+            } catch { return }
+        }
+        Save-4688Cursor -RecordId $cursor
+    }
+    try {
+        $latest = Get-WinEvent -LogName 'Security' -MaxEvents 1 -ErrorAction Stop
+        if($latest -and ([long]$latest.RecordId -lt $cursor)) {
+            Log-Error "Security log reset detected: last record $($latest.RecordId), saved cursor $cursor. Evidence gap possible."
+            $cursor = 0L
+            Save-4688Cursor -RecordId 0
+            return
+        }
+    } catch { Log-Error "Cannot read Security log head: $($_.Exception.Message)"; return }
+    try {
+        # Query by record ID rather than a sliding time window. -Oldest keeps
+        # catch-up incremental, preventing high-volume periods from skipping events.
+        $query = "*[System[(EventID=4688) and (EventRecordID > $cursor)]]"
+        $events = @(Get-WinEvent -LogName 'Security' -FilterXPath $query -Oldest -MaxEvents 400 -ErrorAction Stop)
+    } catch {
+        if([string]$_.FullyQualifiedErrorId -notmatch 'NoMatchingEventsFound') {
+            Log-Error "4688 archival query failed: $($_.Exception.Message)"
+        }
+        return
+    }
+    if($events.Count -eq 0) { return }
+    $newest = $cursor
+    $groups = @{}
+    foreach($evt in $events) {
+        try {
+            $entry = Convert-Security4688 -Event $evt
+            $day = $evt.TimeCreated.ToString('yyyyMMdd')
+            if(-not $groups.ContainsKey($day)) {
+                $groups[$day] = New-Object 'System.Collections.Generic.List[string]'
+            }
+            $groups[$day].Add((ConvertTo-Json -InputObject $entry -Depth 3 -Compress))
+            $newest = [math]::Max($newest,[long]$evt.RecordId)
+        } catch {
+            # Fail closed: never advance beyond a record that was not archived.
+            Log-Error "4688 conversion failed at record $($evt.RecordId): $($_.Exception.Message)"
+            return
+        }
+    }
+    try {
+        foreach($day in $groups.Keys) {
+            $path = Join-Path $Root ('security4688-' + $day + '.jsonl')
+            $lines = $groups[$day].ToArray()
+            [IO.File]::AppendAllText($path,(([string]::Join([Environment]::NewLine,$lines)) + [Environment]::NewLine),$Utf8)
+        }
+        # Cursor is advanced ONLY after all local archive writes complete.
+        Save-4688Cursor -RecordId $newest
+    } catch { Log-Error "4688 archival write failed (cursor not advanced): $($_.Exception.Message)" }
+}
+
+function Get-ArchivedEvent4688([datetime]$From,[datetime]$To) {
+    $found = New-Object 'System.Collections.Generic.List[object]'
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $limited = $false
+    for($date=$From.Date;$date -le $To.Date;$date=$date.AddDays(1)) {
+        $file=Join-Path $Root ('security4688-' + $date.ToString('yyyyMMdd') + '.jsonl')
+        if(-not (Test-Path -LiteralPath $file)) { continue }
+        try {
+            foreach($line in [IO.File]::ReadLines($file)) {
+                if([string]::IsNullOrWhiteSpace($line)) { continue }
+                try {
+                    $item = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+                    $time = [datetime]$item.At
+                    if($time -ge $From -and $time -le $To) {
+                        $found.Add($item)
+                        if($found.Count -ge 10000) {
+                            $limited = $true
+                            break
+                        }
+                    }
+                } catch {
+                    $errors.Add("Archive line invalid in $($date.ToString('yyyyMMdd'))")
+                    break
+                }
+            }
+        } catch { $errors.Add("Cannot read archive $file : $($_.Exception.Message)") }
+        if($limited) { break }
+    }
+    return [pscustomobject]@{Rows=@($found.ToArray());Error=([string]::Join('; ',$errors.ToArray()));Truncated=$limited}
+}
+
 function Get-Event4688([datetime]$From, [datetime]$To) {
     $events = @()
     $errorText = $null
