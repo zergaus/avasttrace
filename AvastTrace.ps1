@@ -1,4 +1,4 @@
-# AvastTrace v1.1.0 - Windows PowerShell 5.1, Windows 10/11
+# AvastTrace v1.2.0 - Windows PowerShell 5.1, Windows 10/11
 # Purpose: observe process starts and correlate them with Avast log changes.
 # This is a read-only collector except for its own files, scheduled task, and
 # the optional -EnableAudit flag. It never disables or excludes protection.
@@ -7,6 +7,7 @@ param(
     [ValidateSet('Install','Monitor','Capture','Status','Uninstall','SelfTest')]
     [string]$Mode = 'Install',
     [switch]$EnableAudit,
+    [switch]$Preserve4688,
     [datetime]$At = [datetime]::MinValue,
     [datetime]$DetectionAt = [datetime]::MinValue,
     [string]$TargetImage = ''
@@ -15,6 +16,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Join-Path $env:ProgramData 'AvastTrace'
 $ScriptTarget = Join-Path $Root 'AvastTrace.ps1'
+$ConfigPath = Join-Path $Root 'config.json'
+$ArchiveCursorPath = Join-Path $Root 'security4688-cursor.json'
 $TaskName = 'AvastTrace-Collector'
 $TaskPath = '\AvastTrace\'
 $PSExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -39,6 +42,7 @@ function Ensure-Admin {
     Write-Host 'Administrator access is needed; requesting UAC elevation...'
     $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'),'-Mode',$Mode)
     if ($EnableAudit) { $argv += '-EnableAudit' }
+    if ($Preserve4688) { $argv += '-Preserve4688' }
     if ($At -ne [datetime]::MinValue) { $argv += @('-At',('"' + $At.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($DetectionAt -ne [datetime]::MinValue) { $argv += @('-DetectionAt',('"' + $DetectionAt.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($TargetImage) { $argv += @('-TargetImage',('"' + $TargetImage + '"')) }
@@ -57,6 +61,29 @@ function Secure-Folder {
     # SIDs work on non-English Windows. No ACL inheritance, no standard users.
     & icacls.exe $Root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 1>$null
     if ($LASTEXITCODE -ne 0) { throw 'Failed to restrict C:\ProgramData\AvastTrace ACLs.' }
+}
+
+function Read-CollectorConfig {
+    $cfg = [pscustomobject]@{ Preserve4688=$false; MaxArchiveMiB=512 }
+    if(Test-Path -LiteralPath $ConfigPath) {
+        try {
+            $data = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $cfg.Preserve4688 = ($data.Preserve4688 -eq $true)
+            if($data.MaxArchiveMiB -ge 32 -and $data.MaxArchiveMiB -le 4096) {
+                $cfg.MaxArchiveMiB = [int]$data.MaxArchiveMiB
+            }
+        } catch { Log-Error "Cannot read collector config: $($_.Exception.Message)" }
+    }
+    return $cfg
+}
+
+function Save-CollectorConfig([bool]$Capture4688) {
+    $json = ConvertTo-Json -InputObject ([pscustomobject]@{
+        Preserve4688=$Capture4688
+        MaxArchiveMiB=512
+        SavedAt=(Get-Date).ToString('o')
+    }) -Compress
+    [IO.File]::WriteAllText($ConfigPath,$json,$Utf8)
 }
 
 function Log-Json([string]$Name, [object]$Value) {
@@ -529,6 +556,12 @@ function Install {
     Secure-Folder
     if ($PSCommandPath -ne $ScriptTarget) { Copy-Item -LiteralPath $PSCommandPath -Destination $ScriptTarget -Force }
     if($EnableAudit) { Enable-ProcessAudit }
+    $existing = Read-CollectorConfig
+    $save4688 = ($Preserve4688 -or $existing.Preserve4688)
+    if($save4688) {
+        Write-Warning 'OPT-IN: preserving plaintext Security 4688 command lines in a separate, administrator-only local archive. Maximum 512 MiB. Never publish raw logs.'
+    }
+    Save-CollectorConfig -Capture4688 $save4688
     $action = New-ScheduledTaskAction -Execute $PSExe -Argument ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptTarget + '" -Mode Monitor')
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -539,6 +572,7 @@ function Install {
     Write-Host "Installed on $env:COMPUTERNAME. Script: $ScriptTarget"
     Write-Host "Scheduled task: $TaskPath$TaskName (SYSTEM, startup + started now)"
     Write-Host "Records: $Root"
+    Write-Host "4688 local retention opt-in: $save4688 (audit policy unchanged unless -EnableAudit)"
     Write-Host "Check: powershell.exe -NoProfile -File `"$ScriptTarget`" -Mode Status"
 }
 
@@ -550,6 +584,11 @@ function Status {
         $info = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath
         Write-Host "Task: $($task.State); LastResult: $($info.LastTaskResult); LastRun: $($info.LastRunTime)"
     } catch { Write-Warning "Task unavailable: $($_.Exception.Message)" }
+    $cfg = Read-CollectorConfig
+    Write-Host "4688 local preservation: $($cfg.Preserve4688); max $($cfg.MaxArchiveMiB) MiB"
+    if(Test-Path -LiteralPath $ArchiveCursorPath) {
+        try { Write-Host "4688 cursor: $(Get-Content -LiteralPath $ArchiveCursorPath -Raw)" } catch {}
+    }
     $beat = Join-Path $Root 'heartbeat.txt'
     if(Test-Path $beat) { Write-Host "Heartbeat: $(Get-Content -LiteralPath $beat -Raw)" }
     else { Write-Warning 'No heartbeat yet; monitor may not be running.' }
