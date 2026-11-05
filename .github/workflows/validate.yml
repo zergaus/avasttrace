@@ -87,7 +87,7 @@ jobs:
         run: |
           $installed = Join-Path $env:ProgramData 'AvastTrace\AvastTrace.ps1'
           try {
-            & .\Install.ps1
+            & .\Install.ps1 -Preserve4688
             if (-not (Test-Path -LiteralPath $installed)) { throw 'Installer failed to place collector' }
 
             $expected = ((Get-Content SHA256SUMS.txt | Select-Object -First 1) -split '\s+')[0]
@@ -97,6 +97,21 @@ jobs:
             $task = Get-ScheduledTask -TaskPath '\AvastTrace\' -TaskName 'AvastTrace-Collector'
             if (-not $task) { throw 'Scheduled task missing after install' }
             Write-Host "PASS pinned bootstrap installation: SHA256=$actual Task=$($task.State)"
+            # The CI Windows runner has Security events available. Validate that
+            # the SYSTEM collector actually persists opt-in 4688 records.
+            Start-Sleep -Seconds 18
+            $config = Get-Content (Join-Path $env:ProgramData 'AvastTrace\config.json') -Raw | ConvertFrom-Json
+            if(-not $config.Preserve4688){ throw 'Retention opt-in did not persist' }
+            $archives = @(Get-ChildItem (Join-Path $env:ProgramData 'AvastTrace') -Filter 'security4688-*.jsonl' -File)
+            if($archives.Count -eq 0){
+              $errs = @(Get-ChildItem (Join-Path $env:ProgramData 'AvastTrace') -Filter 'errors-*.jsonl' | ForEach-Object { Get-Content $_.FullName -Tail 10 })
+              Write-Host "Collection errors: $($errs -join '; ')"
+              throw 'SYSTEM monitor did not create any 4688 command evidence archive'
+            }
+            if((Get-Content -LiteralPath $archives[0].FullName -TotalCount 1).Length -lt 30) {
+              throw '4688 evidence archive has no usable JSONL'
+            }
+            Write-Host "PASS opt-in 4688 archive persistence: files=$($archives.Count)"
           }
           finally {
             if (Test-Path -LiteralPath $installed) {
