@@ -846,6 +846,33 @@ function Invoke-CorrelationSelfTest {
     $none = Get-ProcessChains -Events $records -Anchor $start -TargetImage 'notpresent.exe'
     if($none.SelectedCount -ne 0) { throw 'Unexpected target false positive' }
     Write-Host 'PASS synthetic 4688 process ancestry and target filtering'
+
+    # A Security.evtx record might be overwritten hours later. Test that the
+    # archived JSONL alone supports the same historical incident reconstruction.
+    $archiveTime = [datetime]'2031-02-23T12:00:00'
+    $archivePath = Join-Path $Root 'security4688-20310223.jsonl'
+    Ensure-Folder
+    if(Test-Path -LiteralPath $archivePath) { throw 'Refusing to overwrite an existing self-test archive' }
+    try {
+        $testItems = @(
+            [pscustomobject]@{At=$archiveTime.AddSeconds(-2).ToString('o');EventRecordId=810;ProcessIdHex='0xA0';ParentIdHex='0x01';Process='C:\test\Host.exe';Parent='C:\Windows\explorer.exe';CommandLine='Host.exe';User='TEST';Source='Security4688'},
+            [pscustomobject]@{At=$archiveTime.AddSeconds(-1).ToString('o');EventRecordId=811;ProcessIdHex='0xB0';ParentIdHex='0xA0';Process='C:\Windows\cmd.exe';Parent='C:\test\Host.exe';CommandLine='cmd.exe /c npm run status';User='TEST';Source='Security4688'},
+            [pscustomobject]@{At=$archiveTime.ToString('o');EventRecordId=812;ProcessIdHex='0xC0';ParentIdHex='0xB0';Process='C:\Windows\conhost.exe';Parent='C:\Windows\cmd.exe';CommandLine='conhost.exe -ForceV1';User='TEST';Source='Security4688'}
+        )
+        $lines = @($testItems | ForEach-Object { ConvertTo-Json -InputObject $_ -Compress -Depth 4 })
+        [IO.File]::WriteAllLines($archivePath,$lines,$Utf8)
+        $historical = Get-Event4688 -From $archiveTime.AddSeconds(-5) -To $archiveTime.AddSeconds(5)
+        if($historical.Rows.Count -lt 3 -or $historical.ArchiveRecordCount -lt 3) {
+            throw 'Historical 4688 archive was not used when Security.evtx had no events'
+        }
+        $restored = Get-ProcessChains -Events $historical.Rows -Anchor $archiveTime -TargetImage 'conhost.exe'
+        if($restored.SelectedCount -lt 1 -or @($restored.Candidates[0].Chain).Count -lt 3) {
+            throw 'Archived 4688 ancestry reconstruction failed'
+        }
+        Write-Host 'PASS archived historical 4688 rehydration and command ancestry'
+    } finally {
+        Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 try {
