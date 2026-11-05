@@ -1,4 +1,4 @@
-# AvastTrace v1.3.0 - Windows PowerShell 5.1, Windows 10/11
+# AvastTrace v1.2.0 - Windows PowerShell 5.1, Windows 10/11
 # Purpose: observe process starts and correlate them with Avast log changes.
 # This is a read-only collector except for its own files, scheduled task, and
 # the optional -EnableAudit flag. It never disables or excludes protection.
@@ -8,7 +8,6 @@ param(
     [string]$Mode = 'Install',
     [switch]$EnableAudit,
     [switch]$Preserve4688,
-    [switch]$CompactLogs,
     [datetime]$At = [datetime]::MinValue,
     [datetime]$DetectionAt = [datetime]::MinValue,
     [string]$TargetImage = ''
@@ -44,7 +43,6 @@ function Ensure-Admin {
     $argv = @('-NoProfile','-ExecutionPolicy','Bypass','-File',('"' + $PSCommandPath + '"'),'-Mode',$Mode)
     if ($EnableAudit) { $argv += '-EnableAudit' }
     if ($Preserve4688) { $argv += '-Preserve4688' }
-    if ($CompactLogs) { $argv += '-CompactLogs' }
     if ($At -ne [datetime]::MinValue) { $argv += @('-At',('"' + $At.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($DetectionAt -ne [datetime]::MinValue) { $argv += @('-DetectionAt',('"' + $DetectionAt.ToString('yyyy-MM-dd HH:mm:ss') + '"')) }
     if ($TargetImage) { $argv += @('-TargetImage',('"' + $TargetImage + '"')) }
@@ -66,12 +64,11 @@ function Secure-Folder {
 }
 
 function Read-CollectorConfig {
-    $cfg = [pscustomobject]@{ Preserve4688=$false; CompactLogs=$false; MaxArchiveMiB=512 }
+    $cfg = [pscustomobject]@{ Preserve4688=$false; MaxArchiveMiB=512 }
     if(Test-Path -LiteralPath $ConfigPath) {
         try {
             $data = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
             $cfg.Preserve4688 = ($data.Preserve4688 -eq $true)
-            $cfg.CompactLogs = ($data.CompactLogs -eq $true)
             if($data.MaxArchiveMiB -ge 32 -and $data.MaxArchiveMiB -le 4096) {
                 $cfg.MaxArchiveMiB = [int]$data.MaxArchiveMiB
             }
@@ -80,10 +77,9 @@ function Read-CollectorConfig {
     return $cfg
 }
 
-function Save-CollectorConfig([bool]$Capture4688,[bool]$EnableCompaction) {
+function Save-CollectorConfig([bool]$Capture4688) {
     $json = ConvertTo-Json -InputObject ([pscustomobject]@{
         Preserve4688=$Capture4688
-        CompactLogs=$EnableCompaction
         MaxArchiveMiB=512
         SavedAt=(Get-Date).ToString('o')
     }) -Compress
@@ -196,114 +192,9 @@ function Save-4688Cursor([long]$RecordId) {
     [IO.File]::WriteAllText($ArchiveCursorPath,(ConvertTo-Json $state -Compress),$Utf8)
 }
 
-# Closed-day GZIP conversion (opt-in). Reversible byte-for-byte after
-# SHA-256 verification; no daily source file is removed before verification.
-# The active day is NEVER compacted while Monitor may still append to it.
-function Test-GzipOriginalHash([string]$Compressed,[string]$ExpectedSha256) {
-    $file = $null
-    $gz = $null
-    $sha = $null
-    try {
-        $file = [IO.File]::Open($Compressed,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
-        $gz = [IO.Compression.GZipStream]::new($file,[IO.Compression.CompressionMode]::Decompress,$false)
-        $sha = [Security.Cryptography.SHA256]::Create()
-        $actual = [BitConverter]::ToString($sha.ComputeHash($gz)).Replace('-','')
-        return [string]::Equals($actual,$ExpectedSha256,[StringComparison]::OrdinalIgnoreCase)
-    } finally {
-        if($null -ne $sha) { $sha.Dispose() }
-        if($null -ne $gz) { $gz.Dispose() }
-        if($null -ne $file) { $file.Dispose() }
-    }
-}
-
-function Compress-OneFinalizedLog([string]$Path) {
-    $name = [IO.Path]::GetFileName($Path)
-    if($name -notmatch '^(process|security4688)-([0-9]{8})\.jsonl$') {
-        throw "Unexpected compaction target name: $name"
-    }
-    $day = [datetime]::ParseExact($Matches[2],'yyyyMMdd',[Globalization.CultureInfo]::InvariantCulture)
-    if($day -ge (Get-Date).Date) { throw "Never compact an active-day log: $name" }
-    $target = $Path + '.gz'
-    $temp = $target + '.tmp'
-    $expected = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-    if(Test-Path -LiteralPath $target) {
-        if(-not (Test-GzipOriginalHash -Compressed $target -ExpectedSha256 $expected)) {
-            throw "Existing compressed log does not match source: $target"
-        }
-        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-        return $target
-    }
-    if(Test-Path -LiteralPath $temp) {
-        # Previous interruption: never assume an incomplete temporary gzip is valid.
-        Remove-Item -LiteralPath $temp -Force -ErrorAction Stop
-    }
-    $reader = $null; $writer = $null; $compressor = $null
-    try {
-        $reader = [IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
-        $writer = [IO.File]::Open($temp,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
-        $compressor = [IO.Compression.GZipStream]::new($writer,[IO.Compression.CompressionMode]::Compress,$false)
-        $reader.CopyTo($compressor)
-    } finally {
-        if($null -ne $compressor) { $compressor.Dispose() }
-        if($null -ne $writer) { $writer.Dispose() }
-        if($null -ne $reader) { $reader.Dispose() }
-    }
-    if(-not (Test-GzipOriginalHash -Compressed $temp -ExpectedSha256 $expected)) {
-        throw "Post-compression SHA256 validation failed; original retained: $Path"
-    }
-    [IO.File]::Move($temp,$target)
-    # Avoid deleting bytes if someone changed the original during compaction.
-    $still = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-    if($still -ne $expected) { throw "Source changed during compression; source retained: $Path" }
-    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
-    return $target
-}
-
-function Compact-FinalizedLogs([int]$MaxFiles=2) {
-    if($MaxFiles -lt 1) { return }
-    $today=(Get-Date).Date
-    $count=0
-    foreach($file in @(Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^(process|security4688)-[0-9]{8}\.jsonl$' } |
-        Sort-Object LastWriteTime)) {
-        if($count -ge $MaxFiles) { break }
-        if($file.Name -notmatch '^(process|security4688)-([0-9]{8})\.jsonl$') { continue }
-        $day=[datetime]::ParseExact($Matches[2],'yyyyMMdd',[Globalization.CultureInfo]::InvariantCulture)
-        if($day -ge $today) { continue }
-        try {
-            $packed=Compress-OneFinalizedLog -Path $file.FullName
-            Write-Host "Verified archive: $packed"
-        } catch {
-            Log-Error "Log compaction failed for $($file.Name): $($_.Exception.Message)"
-        }
-        $count++
-    }
-}
-
-# Returns a lazy stream of lines. The caller can read both finalized .gz
-# and active .jsonl files without expanding compressed logs onto disk.
-function Read-LogTextLines([string]$Path) {
-    if(-not $Path.EndsWith('.gz',[StringComparison]::OrdinalIgnoreCase)) {
-        foreach($line in [IO.File]::ReadLines($Path)) { Write-Output $line }
-        return
-    }
-    $raw=$null; $gz=$null; $reader=$null
-    try {
-        $raw=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
-        $gz=[IO.Compression.GZipStream]::new($raw,[IO.Compression.CompressionMode]::Decompress,$false)
-        $reader=[IO.StreamReader]::new($gz,[Text.Encoding]::UTF8,$true)
-        while(-not $reader.EndOfStream) { Write-Output $reader.ReadLine() }
-    } finally {
-        if($null -ne $reader) { $reader.Dispose() }
-        if($null -ne $gz) { $gz.Dispose() }
-        if($null -ne $raw) { $raw.Dispose() }
-    }
-}
-
 function Get-ArchiveSize {
     $total = [long]0
-    foreach($file in @(Get-ChildItem -LiteralPath $Root -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^security4688-[0-9]{8}\.jsonl(\.gz)?$' })) {
+    foreach($file in @(Get-ChildItem -LiteralPath $Root -Filter 'security4688-*.jsonl' -File -ErrorAction SilentlyContinue)) {
         $total += [long]$file.Length
     }
     return $total
@@ -395,10 +286,9 @@ function Get-ArchivedEvent4688([datetime]$From,[datetime]$To) {
     $limited = $false
     for($date=$From.Date;$date -le $To.Date;$date=$date.AddDays(1)) {
         $file=Join-Path $Root ('security4688-' + $date.ToString('yyyyMMdd') + '.jsonl')
-        if(-not (Test-Path -LiteralPath $file)) { $file += '.gz' }
         if(-not (Test-Path -LiteralPath $file)) { continue }
         try {
-            foreach($line in (Read-LogTextLines -Path $file)) {
+            foreach($line in [IO.File]::ReadLines($file)) {
                 if([string]::IsNullOrWhiteSpace($line)) { continue }
                 try {
                     $item = ConvertFrom-Json -InputObject $line -ErrorAction Stop
@@ -598,20 +488,15 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
     $id = $env:COMPUTERNAME + '-' + (Get-Date).ToString('yyyyMMdd-HHmmss-fff')
     $dest = Join-Path $Root ('incident-' + $id + '.json')
     $processRows = New-Object 'System.Collections.Generic.List[object]'
-    for($day=$from.Date;$day -le $to.Date;$day=$day.AddDays(1)) {
-        $path=Join-Path $Root ('process-' + $day.ToString('yyyyMMdd') + '.jsonl')
-        if(-not (Test-Path -LiteralPath $path)) { $path += '.gz' }
-        if(-not (Test-Path -LiteralPath $path)) { continue }
-        try {
-            foreach($line in (Read-LogTextLines -Path $path)) {
-                try {
-                    $entry = ConvertFrom-Json -InputObject $line -ErrorAction Stop
-                    $t = [datetime]$entry.At
-                    if($t -ge $from -and $t -le $to) { $processRows.Add($entry) }
-                } catch { }
-                if($processRows.Count -ge 20000) { break }
-            }
-        } catch { Log-Error "Process history read failed for $path : $($_.Exception.Message)" }
+    foreach($file in @(Get-ChildItem -LiteralPath $Root -Filter 'process-*.jsonl' -ErrorAction SilentlyContinue |
+                   Sort-Object LastWriteTime -Descending | Select-Object -First 3)) {
+        foreach($line in @(Get-Content -LiteralPath $file.FullName -Tail 15000 -ErrorAction SilentlyContinue)) {
+            try {
+                $r = ConvertFrom-Json -InputObject $line -ErrorAction Stop
+                $t = [datetime]$r.At
+                if($t -ge $from -and $t -le $to) { $processRows.Add($r) }
+            } catch { }
+        }
     }
     $security = Get-Event4688 -From $from -To $to
     $correlations = Get-ProcessChains -Events $security.Rows -Anchor $anchor -TargetImage $TargetImage
@@ -659,7 +544,7 @@ function Capture-Incident([datetime]$When,[string]$Reason,[string]$TargetImage='
         }
     } catch { $signature = [pscustomobject]@{Error=$_.Exception.Message} }
     $report = [pscustomobject]@{
-        Version='1.3.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
+        Version='1.2.0'; Host=$env:COMPUTERNAME; Generated=(Get-Date).ToString('o')
         AlertAt=$When.ToString('o') # deprecated: observed reference, NOT proven detection
         ReferenceObservedAt=$When.ToString('o')
         ObservationType=$observationType
@@ -794,7 +679,6 @@ function Monitor {
     $source = 'AvastTrace.ProcessStart'
     $config = Read-CollectorConfig
     $lastArchiveSweep = [datetime]::MinValue
-    $lastCompactSweep = [datetime]::MinValue
     $script:ArchiveQuotaWarned = $false
     try {
         Register-WmiEvent -Class Win32_ProcessStartTrace -SourceIdentifier $source -ErrorAction Stop | Out-Null
@@ -851,11 +735,6 @@ function Monitor {
                 catch { Log-Error "4688 preservation failed: $($_.Exception.Message)" }
                 $lastArchiveSweep = Get-Date
             }
-            if($config.CompactLogs -and ((Get-Date) - $lastCompactSweep).TotalMinutes -ge 15) {
-                try { Compact-FinalizedLogs -MaxFiles 2 }
-                catch { Log-Error "Daily log compaction failed: $($_.Exception.Message)" }
-                $lastCompactSweep = Get-Date
-            }
             if(((Get-Date) - $lastBeat).TotalSeconds -ge 30) {
                 [IO.File]::WriteAllText((Join-Path $Root 'heartbeat.txt'), (Get-Date).ToString('o'), $Utf8)
                 $lastBeat = Get-Date
@@ -894,11 +773,7 @@ function Install {
     if($save4688) {
         Write-Warning 'OPT-IN: preserving plaintext Security 4688 command lines in a separate, administrator-only local archive. Maximum 512 MiB. Never publish raw logs.'
     }
-    $compact = ($CompactLogs -or $existing.CompactLogs)
-    if($compact) {
-        Write-Warning 'OPT-IN: closed-day JSONL logs will be replaced by SHA-256 verified gzip archives. Original bytes remain recoverable by decompression.'
-    }
-    Save-CollectorConfig -Capture4688 $save4688 -EnableCompaction $compact
+    Save-CollectorConfig -Capture4688 $save4688
     $action = New-ScheduledTaskAction -Execute $PSExe -Argument ('-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ScriptTarget + '" -Mode Monitor')
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -910,7 +785,6 @@ function Install {
     Write-Host "Scheduled task: $TaskPath$TaskName (SYSTEM, startup + started now)"
     Write-Host "Records: $Root"
     Write-Host "4688 local retention opt-in: $save4688 (audit policy unchanged unless -EnableAudit)"
-    Write-Host "Closed-day gzip compression: $compact"
     Write-Host "Check: powershell.exe -NoProfile -File `"$ScriptTarget`" -Mode Status"
 }
 
@@ -924,7 +798,6 @@ function Status {
     } catch { Write-Warning "Task unavailable: $($_.Exception.Message)" }
     $cfg = Read-CollectorConfig
     Write-Host "4688 local preservation: $($cfg.Preserve4688); max $($cfg.MaxArchiveMiB) MiB"
-    Write-Host "Closed-day gzip compression: $($cfg.CompactLogs)"
     if(Test-Path -LiteralPath $ArchiveCursorPath) {
         try { Write-Host "4688 cursor: $(Get-Content -LiteralPath $ArchiveCursorPath -Raw)" } catch {}
     }
